@@ -519,6 +519,55 @@ python -m eval rag diff v1_20260806_225842 v1_20260807_181028
 
 这几个坑的共同点是：**评测链路本身也是一条要上生产的系统，它自己也会坏、也会静默出错**——所以评测代码里到处是"显式报错、不静默吞、降级可见"，把评测的可靠性当第一优先。
 
+**面试官继续追问**：评估集是人工标的，那评测数据本身——一条 EvalRecord 里哪些是标的、哪些是系统跑的？20+ 指标是不是每条都算全？有没有样本被排除在分母外？
+
+## Q10（追问）评测数据的真相：一条 EvalRecord 从哪来、分母怎么过滤、20+ 指标怎么摊
+
+**我：** 评测数据不是"评估集跑一下就有"，它是**三段拼起来的一条完整记录**（`EvalRecord`，`runs/*.jsonl` 一行一条）：
+
+> Q10 评测数据三段来源一图看懂：
+
+```text
+EvalRecord = 三段数据拼成（一次问答 → 一份全息记录）
+   │
+   ① 评估集复制   eval_set_v1.jsonl 直接带过来
+      query / intent_l2 / requires_rag / reference_doc_ids
+      = 判分的"标准答案"，永远不动
+   │
+   ② 真实链路     SSE /rag/v3/chat 流式拿
+      response / thinking / latency_ms / first_token_ms / final_status
+      = 回答质量 & 延迟指标的数据源
+   │
+   ③ 评测旁路     JSON /rag/eval（app.eval.enabled=true）
+      retrieved_doc_ids / intent_pred / has_kb / has_mcp / trace_id
+      = 检索证据 & 意图判定的数据源
+   ▼
+一次问答，三段合成一条
+   "问题 + 答案 + 证据 + 意图" 全息可回放
+   = 20+ 指标的原材料，全在这一条里
+```
+
+1. **EvalRecord 分三段来源**：评估集复制（标准答案）、真实链路 SSE 拿的（回答/延迟）、评测旁路 `/rag/eval` 拿的（证据/意图）。**为什么必须拆三段**：答案和证据不在同一份数据里——SSE 流里只有最终回答，检索证据（docIds/contexts）不体现，必须从旁路拿，两路拼起来才是完整记录。这也是 `schemas.py` 注释里"禁止裸 dict、数据沿三个类型搬一遍"的原因——字段一处定义，读写两端共享，新增字段不会悄悄漏。
+
+2. **20+ 指标不是每条都算全，每个指标有自己"有资格被评"的样本集**：
+
+| 指标组 | 分母过滤（eligible） |
+|---|---|
+| 检索（Hit@K / Recall@K / MRR） | 只统计 `requires_rag=true` **且** `reference_doc_ids` 非空——SYSTEM 兜底类样本不污染检索指标 |
+| 行为（误拒 / 兜底 / 过召回） | 按 `requires_rag` 分流：true 组看误拒/兜底，false 组看过召回 |
+| 意图（Top-1） | `intent_l2` 为空的样本不算（触发澄清的没有标准答案） |
+| RAGAS 五指标 | `filter_evaluable`：response / contexts / reference 三项齐全 **且** `final_status=success`，其余记 skip_reason 不参与均值 |
+
+3. **所以一条 EvalRecord 能摊出 20+ 指标，但每个指标的分母是它的"合格样本子集"**：`intent_top1 + hit@1/3/5/10 + recall@K(must+inclusive 两种) + mrr@10 + 行为3 + 延迟3 + ragas5` 差不多 25 个，全部从同一条记录算出来，只是各自过滤条件不同——**分母是脚本里写死的 eligibility，不是事后挑的**。
+
+> 💡 面试官追问（真实被问）：既然有分母过滤，+10.3% 这些数字是不是"挑出来的"？
+>
+> **我：** 不是。分母规则是**在评测脚本里写死的**（`metrics/*.py` 各自的 eligible 过滤、`filter_evaluable`），不是事后挑样本。而且 +10.3% 是 **diff 同一评测集、两次 run 的整体均值之差**——两次 run 用同一批样本、同一条过滤逻辑，两边口径完全一致，差得出来才是真变化。真要挑数字，得把每轮的过滤条件一起改，那不是评测，是表演。
+
+> 💡 面试官追问：你前面说"标注质量决定评测可信度"，怎么防评估集本身骗人？
+>
+> **我：** 三道闸：① **硬字段校验**——requires_rag / reference_doc_ids 是判分基准，缺了样本直接不参与相关指标，标注不全自己露馅；② **docId 对齐自检**（`sanity_check_doc_id_alignment`）——评测数据里 chunk 维度 docId 和 contexts 文本还原的 docId 不一致时 Hit@1/MRR 会失真，score 阶段先报警，而不是等指标出来才发现被骗；③ **人工校正回流**（manual override 优先，人工值覆盖 RAGAS）——关键样本的标注质量有人兜底。评估集和被测系统一样，是持续维护、防恶化的资产。
+
 ---
 
 ## 🪝 追问钩子速览（每段答案埋了什么）
@@ -546,6 +595,8 @@ python -m eval rag diff v1_20260806_225842 v1_20260807_181028
 | "+10.3% 是百分点不是增幅" | 指标口径诚实性 | ✅ Q8 |
 | "失败样本 = 优化清单" | 评测驱动优化闭环 | ✅ Q9 |
 | "评测也是一条要上生产的系统" | 评测自身的可靠性 | ✅ Q9b |
+| "EvalRecord 三段数据源" | 评测数据从哪来、为什么答案和证据分开拿 | ✅ Q10（评估集/真实链路/旁路三段拼） |
+| "分母过滤：requires_rag=true、三项齐全才评" | 数字可信度、是否挑样本 | ✅ Q10（分母写死 eligibility，diff 同口径） |
 
 ---
 
