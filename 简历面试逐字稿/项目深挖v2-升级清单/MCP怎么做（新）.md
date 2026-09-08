@@ -3,7 +3,7 @@
 > 简历产出：基于 MCP 协议集成多业务工具，支持多工具并行调用，扩展智能问答与 Agent 能力
 > 覆盖模块：MCP（mcp-server 独立进程 + rag/core/mcp 客户端 + agent/tool 桥接 + 意图树）
 > 熟练度：🔴
-> 最后复习：2026-09-07
+> 最后复习：2026-09-08
 
 > 围绕简历产出——「基于 MCP 协议集成多业务工具，支持多工具并行调用，扩展智能问答与 Agent 能力」——的完整一问一答逐字稿。
 > 回答内容基于**当前最新代码**（HEAD ~2026-09-06），是对旧《MCP怎么做.md》的全面升级：工具从 6 个扩到 **11 个并分读/写**，新增 **写操作执行前确认** 与 **技能手册遮蔽** 两条治理链路。
@@ -27,47 +27,37 @@
 
 ---
 
-> 🕐 真实链路执行时序（开场先画这张图，含新版写确认支路）：
+## 🎤 开场总览（45 秒版 · 端到端主线，可直接背）
 
-```text
- LLM(Agent)         MCP Client(rag/core/mcp)     MCP Server(独立进程 :9099)        业务系统
-    │                        │                           │                         │
-    │ 需要外部工具能力         │                           │                         │
-    │ ① 输出 tool_use 计划     │                           │                         │
-    │                        │ ② 提参(LLM 低温) + 三态分流  │                         │
-    │                        │──JSON-RPC(工具名+参数)──────►│ ③ 校验并执行工具          │
-    │                        │                           │──HTTP / RPC────────────►│ 结果
-    │                        │◄─────────────────────────│ 结构化工具结果            │
-    │◄───────────────────────│ ③ 结果注入上下文，LLM 继续  │                         │
-    │                        │                           │                         │
-    │ 【新版·写操作确认支路】    │                           │                         │
-    │ 模型要调 leave_submit    │                           │                         │
-    │ → McpToolBridge 属写操作 │                           │                         │
-    │ → 先弹确认卡(ASKING)     │                           │                         │
-    │ → AWAITING_CONFIRM 落库 │                           │                         │
-    │ → 用户点确认 confirm 端点 │                           │                         │
-    │ → 从 Agent 状态取原件续跑 │                           │                         │
-    ▼                        ▼                           ▼                         ▼
-```
-
----
-
-## 🎤 开场总览（45 秒版，可直接背）
-
-> 面试官问"MCP 在你们项目里是怎么用的？为什么选 MCP？"时，先把下面这段一气呵成讲完，再落到 Q1 展开。
+> 面试官问"MCP 在你们项目里是怎么用的？为什么选 MCP？"时，把下面这段**端到端主线**一气呵成讲完——它就是你的开场总览：怎么把工具接进来（装配）→ 只读怎么直调 → 写操作怎么设闸。讲的时候不画图，锚点图只在你被要求"把链路从头捋一遍 / 画一下"时才掏出来。
 > 末尾留的钩子（强制自报读写 / LLM 提参三态 / 两层并行 / 写操作确认卡 / 技能遮蔽）正好接 Q2 / Q5 / Q7 / Q10 / Q11。
 
-**我：** 我们做 MCP，是为了解决一个问题——知识问答平台光有"检索知识库"不够，用户会问"今天上海天气怎么样""查一下华东区销售数据""帮我提个请假申请"这类要**调用外部业务能力**的问题。这些能力不该写死在 RAG 链路里，所以用 **MCP（Model Context Protocol）** 把工具能力"协议化"。
+**我：** 我们做 MCP，是回答一个问题——知识问答平台不能只会"检索知识库"，用户会问"上海今天天气怎么样""查一下华东区销售数据""帮我请个假"，这些要调**外部业务工具**。我们没有把它们写死在 RAG 链路里，而是用 **MCP 协议**接进来，三层角色：**`mcp-server` 独立进程（跑 9099）负责"自报能力 + 执行"；Client 在启动时 `listTools()` 发现注册；消费侧是 Agent + RAG 检索链路，决定怎么用**。这里有个边界要先讲清：Client 和消费侧其实在 bootstrap **同一个 JVM**，真正跨进程的只有到 mcp-server 那一段 `/mcp` HTTP——所以 Client 是 1:1 的协议翻译、没有业务判断，业务判断全在消费侧，这两层职责因此能分开。
 
-但 MCP 演进到第二版，重点已经不是"接进来"，而是"**管住它**"。因为工具从 6 个扩到 **11 个，而且不再全是查询**——出现了请假提交、资产换新、会议室预订这类**写操作**。查询可以放开让模型并行调，写操作会动真实业务数据，必须**层层设闸**。所以我们的设计分成四件事：
+为什么这么分层？关键在**工具自描述**：每个工具带 name / description / inputSchema，模型才"看得懂、能按 Schema 传参"自主调用；读写也从这个根上分开——`McpServerConfig.requireReadOnlyHint` 在**启动时**强制每个工具用 annotations 自报只读还是写操作，**不声明整个服务不让起**。现在 Server 是 10 个 executor 类、11 个工具：8 个只读随便调，3 个写操作层层设闸。
 
-**第一，三层架构 + 工具自描述，把工具能力"协议化"。** Server 是独立进程（`mcp-server`，跑 9099，Spring Boot + Streamable HTTP），现在暴露 **10 个 executor 类、11 个工具**（8 个只读查询 + 3 个写操作）；Client 在 `rag/core/mcp` 启动时 `listTools()` 动态发现注册；消费侧是 RAG 检索链路 + Agent。选 MCP 而不是硬编码 Java 调用：一是解耦，二是工具自描述（name/description/inputSchema），三是给 Agent 用——模型要"看到工具描述 + 按 Schema 传参"才能自主调用。
+调用就分两条路。**只读**：模型读自描述 → 决定调 weather_query → 权限门 `allow` 直通 → 桥把阻塞调用切到 boundedElastic → Client 序列化成 **JSON-RPC 跨 `/mcp`** 打到 mcp-server → 执行完结果回填 → 模型二次推理组织人话 → SSE 推给前端。
 
-**第二，读写分层，从 Server 就强制。** 每个工具必须用 `annotations` 自报只读还是写操作——`McpServerConfig.requireReadOnlyHint` 在**启动时**校验，哪个工具没声明 readOnlyHint 直接抛异常不让起。读工具进查询链路随便调，写工具进 Agent 后要过确认。
+**写操作**：模型想调 leave_submit（mcpId） → `McpToolBridge`（`extends ToolBase`）返回 `ask` → **引擎不执行，先停下来**：弹确认卡，消息以 `AWAITING_CONFIRM` 落库挂起。用户点"同意"走 confirm 端点，**从 Agent 状态里取回工具调用原件续跑**——前端只传同意/拒绝，参数篡改不了；点"取消"，`AgentConfirmDenialMiddleware` 把框架那句冷冰冰的 "Permission denied by user" 改写成模型能如实转告用户的话。再叠一道**技能遮蔽**：请假、订会议室这类不看手册就办错的操作，模型在 `load_skill` 之前**根本看不见**这个工具。一句话收束：老版解决"怎么把工具接进来"，新版解决"接进来后怎么管住它"——**查询放开、写操作层层设闸**。
 
-**第三，写操作确认卡（新版最有讲究的部分）。** 写工具在意图树节点勾 `require_confirm=true`。Agent 想调它时，`McpToolBridge` 因为 `extends ToolBase` 接入了框架权限检查，返回 `ask`——于是 Agent 停下来，把工具名和参数渲染成确认卡发给用户；消息以 `AWAITING_CONFIRM` 落库。用户点确认，走 confirm 端点，**从 Agent 状态里取回工具调用原件续跑**（前端只传同意/拒绝，防止篡改参数）；用户点取消，`AgentConfirmDenialMiddleware` 把框架冷冰冰的 "Permission denied by user" 改写成让模型如实告诉用户"操作已取消"。一句话：**写工具不拦模型开口，只拦模型动手。**
+> 🧭 背完上面，心里只留**一张锚点图**——被要求画链路时画这一张就够（主链 + 只读直调 + 写确认两分支）：
 
-**第四，技能遮蔽（再管一道）。** 像"请假申请""会议室预订"这种不看手册就容易办错的操作，我们把工具挂进技能的 `tool-ids`。`load_skill` 加载手册之前，`AgentSkillMaskingMiddleware` 从模型视野里**直接遮掉这些工具**——模型根本不知道能调它，必须先去取手册、按手册的步骤办。遮蔽和解锁都只认上下文里那条 `load_skill` 结果，手册被压缩带走、工具跟着收回，同生共死。
+```text
+ 用户提问（前端 → bootstrap，9090/SSE）
+      │
+      ▼
+ bootstrap（消费侧 Agent/检索 + MCP Client，同一 JVM）
+      │  模型读工具自描述 → 决定调 MCP 工具
+      ▼
+ McpToolBridge 权限门（extends ToolBase）
+   ├─ 只读(allow) → JSON-RPC /mcp ──► mcp-server(9099) 执行 ──► 结果回填 → 二次推理 → SSE
+   │
+   └─ 写/需确认(ask) → 引擎停 · 弹确认卡 · AWAITING_CONFIRM 落库
+        ├─ 同意：confirm 端点 → 从 Agent 状态取回调用原件 → /mcp ──► mcp-server 执行
+        └─ 取消：中间件把 Permission denied 改写 → 如实告知
+```
+
+> 这块刻意只留一张图。真被追问，各分支一句话带开：装配怎么发现注册 → Q3/Q4；LLM 提参为什么三态 → Q5/Q6；多工具怎么并行 → Q7；桥为什么从 implements 改成 extends ToolBase → Q9；确认续跑的防篡改细节 → Q10；技能遮蔽同生共死 → Q11；Server 启动强校验怎么做的 → Q2。
 
 > 📦 涉及的表/存储（面试官问"MCP 工具存哪、确认状态存哪"时展开）：
 >
@@ -80,8 +70,6 @@
 > | `t_agent_message` | Agent 确认卡落库：`message_status=AWAITING_CONFIRM` 挂起，续跑后改回 NORMAL；`blocks` 里存 confirm 块（pending/approved/denied/expired） | `message_status`(扩到 VARCHAR(32))、`blocks` JSON |
 
 > DB 升级脚本：`upgrades/v2.0.0/260830_agent_tool_confirm.sql`（`t_intent_node` 加 `require_confirm SMALLINT NOT NULL DEFAULT 0`；`t_agent_message.message_status` 扩宽）+ `260903_agent_skill.sql`。
-
-讲到这里停一下，面试官大概率会顺着追问：Server 工具怎么自报读写？自然语言参数怎么提的？写操作确认具体怎么走？技能遮蔽怎么实现？——正好接上 Q2 / Q5 / Q10 / Q11。
 
 ---
 
