@@ -2,7 +2,7 @@
 
 > **这份文档是干什么的**：记录 Ragent 项目从「RAG 问答系统」升级到「Agentic RAG 平台」过程中的所有升级项。以后要复习或追问，直接把本文件内容（或路径）给 AI，说一句「基于这份升级清单，帮我深入讲 XX」即可。
 >
-> **项目根目录**：`D:\codinglocation\ragent`
+> **项目根目录**：`D:\coding_location\java\zhishixingqiu\nageoffer_\ragent`
 >
 > **一句话定位**：Ragent 是一个基于 Spring Boot 4 + Java 17 的生产级 Agentic RAG 平台，用 AgentScope 框架把 RAG 能力工具化，交给 ReAct Agent 编排调用，叠加 MCP / 长期记忆 / 写操作确认 / Skills / 模型熔断降级。
 
@@ -116,7 +116,7 @@
 
 ```
 ensureBaseline(预建控制行=抽取下界) → loadPending(水位线后的新消息)
-  → claim(抢占抽取权，短事务双校验) → judge(LLM仲裁) → commit(事务提交)
+  → claim(抢占抽取权，靠唯一索引仲裁) → judge(LLM仲裁，事务外) → commit(短事务 + revision/水位双校验)
 ```
 
 - baseline 必须在首条消息落库前建立，否则本轮消息永久漏抽
@@ -124,8 +124,8 @@ ensureBaseline(预建控制行=抽取下界) → loadPending(水位线后的新�
 
 ### LLM 一次调用完成「抽取 + 取舍」—— `memory/AgentMemoryJudge.java`
 
-- 四种动作：`NOOP`（不记）/ `ADD`（新增）/ `SUPERSEDE`（取代，靠 id 指认）/ `RETRACT`（撤销）
-- **反 prompt 注入**：素材用 `<fence nonce="随机串">` 围栏包裹，用户消息里的围栏标签被 `neutralize` 中和
+- LLM 输出**四态**：`NOOP`（不记，解析为 `null` 不入枚举）/ `ADD`（新增）/ `SUPERSEDE`（取代，靠 id 指认）/ `RETRACT`（撤销）；枚举 `AgentMemoryDecision.Action` 只含后三者
+- **反 prompt 注入**：素材用 `<recent_turns nonce="随机串">` / `<existing_memories nonce="随机串">` 围栏包裹，用户消息里的围栏标签被 `neutralize` 中和
 
 ### 上下文裁剪与压缩（两级水位）—— `memory/AgentContextCompactionMiddleware.java`
 

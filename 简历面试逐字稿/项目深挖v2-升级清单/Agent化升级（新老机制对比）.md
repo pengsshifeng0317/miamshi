@@ -211,7 +211,7 @@ AgentStreamEventBridge：思考/工具进度/回答 → SSE → 用户
 > 四层兜底：① `maxIters=10` + `maxRetries=2` 熔断；② 工具**白名单**（固定 `search_knowledge` + 意图树显式配置的 MCP），且检索工具 `isReadOnly=true`，没有危险写工具；③ 工具内部 `KB_ANSWER` 用 **temp=0** 生成、严格基于证据，`tool_result` 返回前还会抹掉内部 docId 锚点，防泄漏到模型可见文本；④ 歧义场景仍会命中意图引导，工具直接返回问句而不是瞎答。
 
 **追问 4：Agent 上下文膨胀这么快，你具体怎么控？**
-> 中间件在每次推理前查水位。预算设成 `context-window-chars=1200000`，两道门按比例派生：超过 50% 用裁剪器把**老的 `search_knowledge` 结果**换成 `[历史工具结果已省略，原长 N 字符，原入参 …]` 占位——**只换结果、不动 tool_use 请求**，所以永不产生孤儿块；超过 80% 才允许压缩成摘要（要调一次摘要模型）。只删白名单工具的**可重查结果**；本轮 + 最近 2 个已完成循环保护不删；回收量不足总字符 20% 就整次不动——因为删太碎会让每次请求的 prompt 前缀都变，模型缓存永远命中不了。
+> 中间件在每次推理前查水位。预算设成 `context-window-chars=100000`（生产 yaml 值；代码默认 1200000 已被覆盖），两道门按比例派生：超过 50% 用裁剪器把**老的 `search_knowledge` 结果**换成 `[历史工具结果已省略，原长 N 字符，原入参 …]` 占位——**只换结果、不动 tool_use 请求**，所以永不产生孤儿块；超过 80% 才允许压缩成摘要（要调一次摘要模型）。只删白名单工具的**可重查结果**；本轮 + 最近 2 个已完成循环保护不删；回收量不足总字符 20% 就整次不动——因为删太碎会让每次请求的 prompt 前缀都变，模型缓存永远命中不了。
 
 **追问 5：跨轮记忆靠什么？为什么下轮还要从 PG 读？**
 > AgentScope 会把整段 ReAct 状态交给我的 `PgAgentStateStore` 序列化到 `t_agent_state`，下轮按 sessionId 反序列化读回，模型能看到上一轮完整的思考与工具结果（这是 agent 多轮一致的底气）。读回的是内存副本，`AgentChatServiceImpl` 在流结束就 `evictStateCache` 清内存缓存——避免常驻内存泄漏，代价只是一次反序列化。
@@ -250,5 +250,5 @@ AgentStreamEventBridge：思考/工具进度/回答 → SSE → 用户
 
 - 本质：**决策权从代码移交给模型**；老 RAG 被收进 `search_knowledge` 工具。
 - 三个关键词：**收编**（老管线→工具）、**重构意图树角色**（入口路由→工具挂载/检索定位）、**两层记忆治理**（50% 裁 / 80% 压）。
-- 三个数字：`maxIters=10`、`context-window-chars=1200000`、白名单 `evictableTools=[search_knowledge]`。
+- 三个数字：`maxIters=10`、`context-window-chars=100000`、白名单 `evictableTools=[search_knowledge]`。
 - 一张表都不许说错：Agent 新增 `t_agent_profile/prompt/conversation/message/state/context_compaction`，老链路会话是 `t_conversation` 三张，**两套分立**。
