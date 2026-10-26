@@ -1,4 +1,22 @@
-# 模拟面试逐字稿：MCP 怎么做（新）
+# 模拟面试逐字稿：MCP 怎么做（新）【已归档 · 勿背】
+
+> ⛔ **本文已过期，仅作历史留档，不要再背。**
+>
+> | 项 | 归档稿写的 | 当前代码实际 |
+> |---|---|---|
+> | 客户端实现 | `McpToolBridge extends ToolBase` | **`McpToolProxy extends McpTool`**（继承 AgentScope 的 McpTool） |
+> | 客户端生命周期 | `McpClientAutoConfiguration` + `DefaultMcpToolRegistry` | **`AgentMcpClients`**（`@PostConstruct` 连接 + `listTools()` 发现） |
+> | 工具目录 | 「resolve 一次定格 + fingerprint」 | **`AgentToolCatalog.ResolvedCatalog`**，另加 `RESERVED_TOOL_NAMES` 与排序稳定指纹 |
+> | 工具数 | 10 executor / 11 工具（8 读 + 3 写） | **23 executor / 24 工具（14 读 + 10 写）**，新增 Bit 电商一套 |
+> | 确认判据 | 意图树 `require_confirm` | **`requireConfirm` 勾选 OR 服务端未声明 `readOnlyHint=true`**（双重来源） |
+> | 参数提取 | `LLMMcpParameterExtractor` 三态 | **已删除**——参数由模型按 inputSchema 直接产出 |
+> | 意图树检索 | 两档（workflow RAG + Agent） | **只剩 Agent 一套**，`rag/core/mcp/` 整包已删 |
+> | MCP SDK | 1.1.2（笔误，实为 0.10.x） | **0.17.0** |
+> | 确认结算 | `resolveConfirmResults()` | **`resolveConfirmResultsOrExpire()`**（含过期结算） |
+>
+> 👉 现行版本：**MCP怎么做（Agent档）.md**
+>
+> 保留原因：旧稿里「三层分工」「读写自报」「确认卡三段式」的**讲法**仍有参考价值，且能对照出「接进来 → 管住它」这条演进线。
 
 > 简历产出：基于 MCP 协议集成多业务工具，支持多工具并行调用，扩展智能问答与 Agent 能力
 > 覆盖模块：MCP（mcp-server 独立进程 + rag/core/mcp 客户端 + agent/tool 桥接 + 意图树）

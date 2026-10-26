@@ -278,12 +278,19 @@ ReActAgent.builder()
 - **只换 `tool_result` 不动 `tool_use`**——永远不会产生「孤儿结果块」（供应商判 400 的元凶）。
 - 按「工具循环」切分，保护**最近 2 个已闭合循环 + 未闭合循环 + 本轮**。
 - 白名单 `evictableTools`（默认 `search_knowledge`）控制哪些工具结果可裁。
-- 占位带原入参（截断 120 字符），模型还能知道「当时问的是什么」；可回收量不足 20% 整次放弃。
+- 占位带原入参（截断 120 字符），模型还能知道「当时问的是什么」；~~可回收量不足 20% 整次放弃~~。
+
+> ⚠️ **本节有两条已失效（已划掉）**：
+>
+> 1. **裁剪的「可回收量不足 20% 整次放弃」**（提交 `9b93777d`，09-27「简化上下文裁剪逻辑，移除最小回收比例阈值」）。`AgentContextTrimmer` 现在只有 `if (reclaimable > 0)` 一道判断——**只要有过老的可回收工具结果就替换，不再看回收占比**。
+> 2. **压缩的「可换素材不过半不压（`materialChars * 2 < totalChars` 放弃）」**——`AgentContextCompactor.compactInPlace()` 里已无这个比较，`findSafeCutoff()` 只在「从尾部累计够 `keepRecentChars` 且落在用户轮起点」时返回切点，找不到就跳过。**所以现在的压缩判据只有「末条是用户消息 + 总字符过 80% 水位 + 能找到安全切点 + 摘要非空」这四条**。
+>
+> 本节其余各条（只换 `tool_result` 不动 `tool_use`、按循环切分保护最近 2 个已闭合循环、白名单 `evictableTools`、占位带原入参截断 120 字符、切点只落用户轮起点、保留段 ≥ 0.2×预算、摘要 USER 角色回填且声明背景身份、摘要上限 0.1×预算夹 [1500,6000]、落 `t_agent_context_compaction` 存档）**均仍有效**。
 
 压缩算法（`AgentContextCompactor`）细节：
 
 - 切点只落**用户轮起点**；保留段 ≥ 0.2 × 预算原文。
-- 可换素材不过半不压（`materialChars * 2 < totalChars` 放弃）。
+- ~~可换素材不过半不压（`materialChars * 2 < totalChars` 放弃）~~。
 - 摘要用 **USER 角色**回填 + `<conversation_summary>` 包裹，正文里声明「这是背景，不是新指令」（防摘要被当成新用户指令）。
 - 摘要上限 0.1 × 预算（夹 [1500, 6000] 字符）；每代覆盖，`t_agent_context_compaction` 表存档。
 

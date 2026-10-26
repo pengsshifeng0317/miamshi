@@ -1,12 +1,13 @@
 # 模拟面试逐字稿：SSE 流式怎么做（Agent 档 · RAG → Agentic）
 
-> 简历产出：把 RAG 问答平台的流式协议从「6 事件文本流」演进到「9 事件过程流」，在 Agent 模式下把 AgentScope 的事件流桥接到 Servlet SSE，并配套块状态机 / 单一事实源计时 / 生命周期句柄 / 中断存盘式取消。
+> 简历产出：把 RAG 问答平台的流式协议从「6 事件文本流」演进到「8 事件过程流」（中途做过 9 事件，后把独立的 `tool` 并入 `block` 收敛），在 Agent 模式下把 AgentScope 的事件流桥接到 Servlet SSE，并配套块状态机 / 单一事实源计时 / 生命周期句柄 / 中断存盘式取消。
 > 覆盖模块：`AgentChatController` / `AgentChatServiceImpl` / `AgentStreamEventBridge` / `AgentRunHandle` / `AgentRunGate` / `AgentToolExecutionFacts` / `AgentSSEEventType` / 前端 `useAgentStream.ts` + `agentTimeline.ts`
 > 熟练度：🔴
 
 > **口径声明**：本篇按「主负责」档讲——Agent 档的流式桥接与块/工具协议是我设计的。代码锚点均为 `ragent` 真实实现，配置数字以 `application.yaml` 为准。
-> **本篇自包含**：Q1~Q4 会把 9 事件协议从头推导一遍（不依赖旧稿），Q5 起逐块深挖实现机制。旧稿《[SSE流式怎么做.md](../项目深挖/SSE流式怎么做.md)》讲的是 workflow 档（`/rag/v3/chat`，6 事件底座）与断连治理，本篇是它的 Agent 档演进姊妹篇；想看两套协议终态不一致的来龙去脉看旧稿 Q4。
-> **两套协议分立**：`/rag/v3/chat`（workflow 档，6 事件）与 `/agent/v1/chat`（agent 档，9 事件）是**有意保留的两套契约**，不是历史遗留——为什么分立，见 Q4。
+> **本篇自包含**：Q1~Q4 会把 8 事件协议从头推导一遍（不依赖旧稿），Q5 起逐块深挖实现机制。旧稿《[SSE流式怎么做.md](../项目深挖/SSE流式怎么做.md)》讲的是 workflow 档（`/rag/v3/chat`，6 事件底座）与断连治理，本篇是它的 Agent 档演进姊妹篇。
+> **两套协议分立**：`/rag/v3/chat`（workflow 档，6 事件）与 `/agent/v1/chat`（agent 档，8 事件）是**有意保留的两套契约**，不是历史遗留——为什么分立，见 Q4。
+> **中途有一次收敛**：Agent 档第一版是 9 事件，`tool` 是独立事件；后来发现它和 `block` 是同一种东西（过程帧），前端要维护两套状态机，于是把工具进度并进 `block` 的 `kind`，事件数回到 8。这次收敛本身是 Q4 的答题素材，不是需要回避的历史。
 
 ---
 
@@ -16,7 +17,9 @@
 
 **我：**
 
-RAG 那一版，一条流从进来到结束就是「检索 → 生成 → 结束」，六个事件全在描述文本怎么来、怎么结束，模型只在最后生成答案。Agent 化之后，一轮里多了**工具调用**和**中断在环确认**这两样东西，协议从 6 个事件演进到 9 个，新增 `block` / `tool` / `hint` / `confirm`，并且把「块的起止」从客户端猜测改成了服务端声明。
+RAG 那一版，一条流从进来到结束就是「检索 → 生成 → 结束」，六个事件全在描述文本怎么来、怎么结束，模型只在最后生成答案。Agent 化之后，一轮里多了**工具调用**和**中断在环确认**这两样东西，协议从 6 个事件演进到 8 个，新增 `block` / `hint` / `confirm`，并且把「块的起止」从客户端猜测改成了服务端声明。
+
+中间还经过一版 9 事件——工具过程单独一个 `tool` 事件。后来砍掉了：`tool` 和 `block` 本质都是「这一段过程开始了/结束了」，前端要为此维护两套几乎同构的状态机，而 `block` 本来就能带 `kind`。合并之后事件少一个、前端少一套状态机，协议反而更整齐。
 
 但协议只是表象，真正的实现升级有三件：
 
@@ -43,39 +46,42 @@ RAG 那一版，一条流从进来到结束就是「检索 → 生成 → 结束
   ├────────────────►│                     │                                        │
   │                 ├───────────────────►│ ① new SseEmitter(900_000ms)            │
   │                 │                     │    streamChat()                        │
-  │                 │                     │ ② runGate.acquire(userId, taskId)     │
-  │                 │                     │    └─ Redis setIfAbsent 抢运行位       │
-  │                 │                     │      抢不到 → 抛异常(未发帧)→JSON       │
-  │                 │                     │ ③ touchConversation + ensureBaseline  │
-  │                 │                     │    + addUserMessage(落库用户消息)      │
-  │                 │                     │ ④ launchStream:                       │
-  │                 │                     │    · new AgentToolExecutionFacts      │
-  │                 │                     │    · new AgentRunHandle               │
-  │                 │                     │    · sender.sendEvent(META) ─────────►│ 前端立刻拿到
-  │                 │                     │    · taskManager.register             │ conversationId/taskId
-  │                 │                     │    · agent.streamEvents(input, ctx)   │
-  │                 │                     │        .doFinally(markUpstreamTerminated)
-  │                 │                     │ ⑤ runHandle.start( 订阅这段 Flux )     │
-  │                 │                     │    events.subscribe(                  │
-  │                 │                     │      bridge::onEvent,   // 每个事件→SSE│
-  │                 │                     │      bridge::onError,                 │
-  │                 │                     │      bridge::onComplete)              │
+  │                 │                     │ ② runGate.acquire(userId, taskId,      │
+  │                 │                     │                   conversationId)       │
+  │                 │                     │    └─ Redis 会话锁 + 用户名额锁          │
+  │                 │                     │      抢不到 → 抛异常(未发帧)→JSON         │
+  │                 │                     │ ③ hasPendingConfirm 检查                │
+  │                 │                     │    touchConversation                    │
+  │                 │                     │    memoryLearner.ensureCursor           │
+  │                 │                     │    addUserMessage(落库用户消息)          │
+  │                 │                     │ ④ launchStream:                        │
+  │                 │                     │    · new AgentToolExecutionFacts        │
+  │                 │                     │    · new AgentRunHandle                 │
+  │                 │                     │    · sender.sendEvent(META) ──────────►│ 前端立刻拿到
+  │                 │                     │    · taskManager.register               │ conversationId/taskId
+  │                 │                     │    · agent.streamEvents(input, ctx)     │
+  │                 │                     │        .doFinally(markUpstreamTerminated)│
+  │                 │                     │ ⑤ runHandle.start( 订阅这段 Flux )       │
+  │                 │                     │    events.subscribe(                    │
+  │                 │                     │      bridge::onEvent,   // 每个事件→SSE  │
+  │                 │                     │      bridge::onError,                   │
+  │                 │                     │      bridge::onComplete)                │
   │  event: meta     │◄───────────────────┤                                        │
-  │  event: message  │◄───────────────────┤ TEXT_BLOCK_DELTA → message{response}   │
-  │  event: tool     │◄───────────────────┤ TOOL_CALL_START → tool{pending}        │
-  │  event: block    │◄───────────────────┤ 封口块 → block 帧                      │
-  │  event: confirm  │◄───────────────────┤ REQUIRE_USER_CONFIRM → confirm 帧      │
-  │  event: finish   │◄───────────────────┤ 先落库拿 messageId，再发               │
-  │  event: done     │◄───────────────────┤ 字面量 "[DONE]"                       │
+  │  event: message  │◄───────────────────┤ TEXT_BLOCK_DELTA → message{response}    │
+  │  event: block    │◄───────────────────┤ TOOL_CALL_START → block{kind:tool,pending}│
+  │  event: block    │◄───────────────────┤ 文本封口块 → block{kind:answer/reasoning} │
+  │  event: confirm  │◄───────────────────┤ REQUIRE_USER_CONFIRM → confirm 帧       │
+  │  event: finish   │◄───────────────────┤ 先落库拿 messageId，再发                 │
+  │  event: done     │◄───────────────────┤ 字面量 "[DONE]"                         │
 ```
 
 **和 workflow 档比，真正多出来的是三处，都在入口这段：**
 
-**一，闸门 `AgentRunGate` 取代了 `@IdempotentSubmit`。** workflow 档的幂等拦截是注解，覆盖的是「控制器返回 emitter 之前」的同步窗口；Agent 档换成 `AgentRunGate`——按用户抢一个 Redis 运行位，覆盖**整个流生命周期**（一条流跑多久，闸门占多久）。为什么必须这样：Agent 一轮可能几十秒、还停下来等人确认，如果只用同步窗口的幂等拦截，用户在等待确认期间再发一问就进去了，会话状态会乱。`runGate.acquire()` 抢不到直接抛异常，**这时 META 还没发**，所以全局异常处理器能干净地返回一个 JSON 错误，而不是像 workflow 档那样「流已经建了只能走流内 reject」。
+**一，闸门 `AgentRunGate` 取代了 `@IdempotentSubmit`。** workflow 档的幂等拦截是注解，覆盖的是「控制器返回 emitter 之前」的同步窗口；Agent 档换成 `AgentRunGate`——**同一会话互斥 + 同一用户最多 5 条并发**，覆盖**整个流生命周期**（一条流跑多久，闸门占多久）。为什么必须这样：Agent 一轮可能几十秒、还停下来等人确认，如果只用同步窗口的幂等拦截，用户在等待确认期间再发一问就进去了，会话状态会乱。`runGate.acquire()` 抢不到直接抛异常，**这时 META 还没发**，所以全局异常处理器能干净地返回一个 JSON 错误，而不是像 workflow 档那样「流已经建了只能走流内 reject」。
 
-**二，落库和建基线挪到了订阅之前。** `touchConversation`（建会话/取标题）→ `ensureExtractionBaseline`（建记忆抽取下界）→ `addUserMessage`（用户消息落库），三件都是**有副作用的落库**，必须赶在 `subscribe` 之前。尤其 `ensureExtractionBaseline`——注释写死「必须在 addUserMessage 之前建立基线，否则本轮消息会被划进历史、漏抽」。这是记忆抽取线的事，不展开，但说明 Agent 档的入口副作用比 workflow 档多。
+**二，落库和建游标挪到了订阅之前。** `hasPendingConfirm`（上一轮还挂着确认卡就拒新问题）→ `touchConversation`（建会话/取标题）→ `memoryLearner.ensureCursor`（建记忆学习游标）→ `addUserMessage`（用户消息落库），四件都是**有副作用或前置约束的事**，必须赶在 `subscribe` 之前。尤其 `ensureCursor`——注释写死「必须先于本轮发言入库」，游标建行时取该用户已有用户消息的 `max(id)`，界线由这一刻决定，晚一步这轮发言就被划进历史、漏学。
 
-**三，最核心的：订阅发生在 `runHandle.start()` 的锁里。** 看 `AgentChatServiceImpl.java:250-255`：
+**三，最核心的：订阅发生在 `runHandle.start()` 的锁里。** 看 `AgentChatServiceImpl.java` 的启动块：
 
 ```java
 runHandle.start(() -> {
@@ -88,7 +94,7 @@ runHandle.start(() -> {
 
 `start()` 的注释讲透了为什么**整段启动要放进锁里**：「整段启动放进锁里，否则取消可能先跑完收尾、这边随后才订阅，工具照样被执行一遍」。这是 Agent 档独有的竞态：workflow 档取消和启动之间没有「框架状态」要保护，Agent 档有——如果取消先跑完收尾、释放了闸门，紧接着 `subscribe` 才把流订阅上，那用户明明点了停止，这一轮的 ReAct 循环照样从头跑、写操作照样执行。所以「启动 + 订阅 + 绑定取消动作」是一个原子块，这个锁是 Q8 生命周期句柄的第一次登场。
 
-**超时是两档**：workflow 档 `rag.default.sse-timeout-ms: 300000`（5 分钟），agent 档 `agent.sse-timeout-ms: 900000`（15 分钟，`AgentProperties.java:49`）。差三倍——Agent 一轮有多次工具调用 + 中间停下来等人确认，5 分钟不够，而且确认挂起时那个 `SseEmitter` 是**一直开着**的（Q11 讲）。
+**超时是两档**：workflow 档 `rag.default.sse-timeout-ms: 300000`（5 分钟），agent 档 `agent.sse-timeout-ms: 900000`（15 分钟）。差三倍——Agent 一轮有多次工具调用 + 中间停下来等人确认，5 分钟不够，而且确认挂起时那个 `SseEmitter` 是**一直开着**的（Q11 讲）。
 
 **埋钩子**：你可能注意到我全程说「推事件」而不是「推 token」。Agent 档这一点的分界比 workflow 档更硬——我推给前端的粒度，既不是模型吐的粒度，也不是框架吐的粒度，中间隔着一座桥。
 
@@ -126,7 +132,7 @@ events.subscribe(bridge::onEvent, bridge::onError, bridge::onComplete);
 
 3. **风险在取消这端。** WebFlux 的取消是「订阅被 dispose」——`SseEmitter` 的取消则是「容器回调 + 我们手动打断框架」。我们后者的取消语义（Q9）已经和 `StreamTaskManager`、`AgentRunHandle` 深度绑定，换 WebFlux 等于把这块推倒重来。
 
-**还有一个 `doFinally` 的细节值得讲**（`AgentChatServiceImpl.java:247-249`）：
+**还有一个 `doFinally` 的细节值得讲**：
 
 ```java
 Flux<AgentEvent> events = agent.streamEvents(input, runtimeContext)
@@ -147,21 +153,21 @@ Flux<AgentEvent> events = agent.streamEvents(input, runtimeContext)
 
 **我**：不能，因为**框架事件是引擎内部的语义，不是给前端的契约**。桥做的就是把前者翻译成后者。
 
-AgentScope 一轮 ReAct 会吐**十一种**事件（`AgentStreamEventBridge.onEvent()` 的 switch，`AgentStreamEventBridge.java:151-172`）：
+AgentScope 一轮 ReAct 会吐**十一种**事件（`AgentStreamEventBridge.onEvent()` 的 switch）：
 
 | 框架事件 | 含义 | 桥翻译成 |
 |---|---|---|
 | `TEXT_BLOCK_DELTA` | 答案文本增量 | `message{type:response}` |
 | `THINKING_BLOCK_DELTA` | 推理增量 | `message{type:think}` |
-| `TOOL_CALL_START` | 模型开始吐工具参数 | `tool{pending}` |
-| `TOOL_RESULT_START` | 工具开始执行 | `tool{running}` |
+| `TOOL_CALL_START` | 模型开始吐工具参数 | `block{kind:tool, status:pending}` |
+| `TOOL_RESULT_START` | 工具开始执行 | `block{kind:tool, status:running}` |
 | `TOOL_RESULT_TEXT_DELTA` | 工具结果增量 | （缓冲，不直接发） |
-| `TOOL_RESULT_END` | 工具结束 | `tool{done/failed}` |
-| `ALL_TOOLS_DENIED` | 整批工具被用户否决 | `tool{denied}` × N |
+| `TOOL_RESULT_END` | 工具结束 | `block{kind:tool, status:done/failed}` |
+| `ALL_TOOLS_DENIED` | 整批工具被用户否决 | `block{kind:tool, status:denied}` × N |
 | `HINT_BLOCK` | 框架运行提示 | `hint` |
 | `EXCEED_MAX_ITERS` | 到迭代上限 | `hint{MAX_ITERATIONS}` |
 | `AGENT_RESULT` | 框架终答（非流式） | 兜底文本 |
-| `REQUIRE_USER_CONFIRM` | 要求用户确认写操作 | `confirm` |
+| `REQUIRE_USER_CONFIRM` | 要求用户确认写操作 | `block{kind:confirm}` + `confirm` |
 
 **为什么必须翻译，直接发不行吗？三个原因：**
 
@@ -169,26 +175,26 @@ AgentScope 一轮 ReAct 会吐**十一种**事件（`AgentStreamEventBridge.onEv
 
 **二，框架事件不是「一个事件一帧」的粒度。** `TOOL_RESULT_TEXT_DELTA` 是工具结果**逐段**吐的（一段文档可能吐几百次），如果每次都发一帧，前端帧数爆炸；所以桥把它**缓冲起来，只在 `TOOL_RESULT_END` 时一次性给**，还要做 64K 截断（Q6）。反过来，`AGENT_RESULT` 是非流式终答——它不产生任何增量，桥得拿它当「没有流式增量时的兜底」用（Q13）。
 
-**三，有些框架事件根本不该透出。** 框架有一个 `STRUCTURED_OUTPUT_TOOL_NAME` 伪工具，是框架自己用结构化输出骗模型的，不是用户要看的，`isInternalTool()` 直接过滤（`AgentStreamEventBridge.java:538-540`）。
+**三，有些框架事件根本不该透出。** 框架有一个 `STRUCTURED_OUTPUT_TOOL_NAME` 伪工具，是框架自己用结构化输出骗模型的，不是用户要看的，`isInternalTool()` 直接过滤。
 
 **所以桥的本质**：把「引擎的过程语义」翻译成「前端的过程契约」，翻译过程中**增删改**——缓冲、截断、过滤、补建（Q6）、投影时间（Q7）。
 
-**埋钩子**：翻译的产物就是那 9 个事件。为什么是 9 个、为什么跟 workflow 档的 6 个刻意分成两套，是下一个问题。
+**埋钩子**：翻译的产物就是那 8 个事件。为什么是 8 个、为什么跟 workflow 档的 6 个刻意分成两套，是下一个问题。
 
 ---
 
-## Q4（追问）协议从 6 到 9 事件，为什么两套分立而不合并？
+## Q4（追问）协议从 6 到 8 事件（中间经过 9），为什么两套分立而不合并？
 
-**面试官追问**：`confirm` / `tool` 这些对 RAG 没意义，但你为什么不干脆把两套合并成一套、RAG 那边不用的事件就空着？
+**面试官追问**：`confirm` / `block` 这些对 RAG 没意义，但你为什么不干脆把两套合并成一套、RAG 那边不用的事件就空着？
 
 **我**：因为**合并会让 RAG 契约背上它永远不会有的状态**。契约的最小化本身是有价值的。先把对照表摆出来：
 
-| 维度 | workflow 档（6） | agent 档（9） | 变化的理由 |
+| 维度 | workflow 档（6） | agent 档（8） | 变化的理由 |
 |---|:--:|:--:|---|
 | 元信息 | `meta` | `meta` | 不变，载荷仍是 `(conversationId, taskId)` |
 | 增量文本 | `message`{response,think} | `message`{response,think,**error**} | **只加 type，协议层一字未改** |
-| 文本块边界 | ❌ | **`block`** | 服务端声明块的起止与类型 |
-| 工具过程 | ❌ | **`tool`** | Agent 有工具调用，RAG 没有 |
+| 文本块边界 | ❌ | **`block`**{kind:answer/reasoning} | 服务端声明块的起止与类型 |
+| 工具过程 | ❌ | **`block`**{kind:tool} | 与文本块共用同一帧型，靠 kind 分流 |
 | 系统提示 | ❌ | **`hint`** | 迭代上限等系统级提示，不落库 |
 | 等确认 | ❌ | **`confirm`** | HITL，与 `finish` 互斥 |
 | 结算 | `finish` | `finish` | 不变 |
@@ -196,23 +202,31 @@ AgentScope 一轮 ReAct 会吐**十一种**事件（`AgentStreamEventBridge.onEv
 | 取消 | `cancel` | `cancel` | 不变 |
 | 限流拒绝 | `reject` | ❌ **无** | 限流在建流前以异常拒掉 |
 
-枚举定义在 `AgentSSEEventType.java:26-78`，类注释第一行就写了「**Agent 模式 SSE 事件协议，与 workflow 协议两套分立**」。
+枚举定义在 `AgentSSEEventType.java`，类注释第一行就写了「**Agent 模式 SSE 事件协议，与 workflow 协议两套分立**」。
 
-**新增的四个事件，背后是三条原则变了：**
+**新增的三个事件，背后是三条原则变了：**
 
 **原则一：从「客户端猜」到「服务端声明」——这是 `block`。** workflow 档里块的边界（哪段是推理、哪段是答案）要前端自己按 `type` 变化推断、时间自己打点。当场渲染没问题，但**刷新后重放历史**时，历史里只有块的类型没有块的起止，前端重打的时间跟真实生成时间对不上。所以 agent 档让服务端主动发 `block` 封口帧，载荷是 `AgentTextBlockSeal(kind, at, startedAt, endedAt, durationMs)`，前端直接渲染不推断。
 
-**原则二：从「流文本」到「流过程」——这是 `tool` 和 `hint`。** workflow 档一轮中间没有可展示的中间态；agent 档会反复调工具，用户需要看到「正在查知识库」「这个工具失败了」。`tool` 载荷 `AgentToolProgress` 带 `displayName`（给人看的名字，不是代码里的 `search_knowledge`）、`batchId` + `callIndex`（一批并行工具的序号）、`durationSource`（耗时来自真测量还是整批共享）。`hint` 不落库——它是运行时提示，不是对话内容，比如到迭代上限发一条「正在生成当前执行结果的总结」，但**不判失败**（框架还会生成终答）。
+**原则二：从「流文本」到「流过程」——这是 `block{kind:tool}` 和 `hint`。** workflow 档一轮中间没有可展示的中间态；agent 档会反复调工具，用户需要看到「正在查知识库」「这个工具失败了」。工具进度走 `block` 帧、`kind=tool`，载荷 `AgentToolProgress` 带 `displayName`（给人看的名字，不是代码里的 `search_knowledge`）、`batchId` + `callIndex`（一批并行工具的序号）、`durationSource`（耗时来自真测量还是整批共享）。`hint` 不落库——它是运行时提示，不是对话内容，比如到迭代上限发一条「正在生成当前执行结果的总结」，但**不判失败**（框架还会生成终答）。
 
 **原则三：从「单向终点」到「可中断的挂起点」——这是 `confirm`。** workflow 档的流只有两种命运：走完或被取消。agent 档多了一种：走到一半停下来等用户裁决。这一步的流语义特殊——`SseEmitter` 得一直开着、`finish` 不能发（没结算完）、但也不能什么都不发（前端在等），所以有了 `confirm`，并且明确它**与 `finish` 互斥**（Q11）。
 
-**为什么两套分立——这是个被反复问的点，我分两层答：**
+**那为什么中间那版 9 事件又收回成 8？** 第一版把工具过程做成了独立 `tool` 事件，理由很充分：工具和文本是两种东西，事件名分开更直观。做完之后发现三个问题：
 
-1. **合并会让 RAG 契约背上不存在的状态。** 如果 RAG 也用 9 事件，那前端针对 RAG 这条流就得处理 `tool`/`confirm`/`block` 三种它**永远不会收到**的事件——协议状态机里多了三条死分支。而「RAG 一条流会不会突然冒出个 confirm」这个问题，靠的是「我们保证它不发」，而不是靠协议本身能表达——这是一种**契约层面的不诚实**。
+1. **前端要维护两套同构状态机。** `tool` 帧和 `block{kind:tool}` 帧表达的是同一件事——「这个工具块开始了/状态变了/结束了」——但字段形状不同，前端 `agentTimeline.ts` 得写两套 apply 逻辑，还要处理两者交错到达时的顺序。
+2. **两套帧型的生命周期本来就该在一起。** 文本块封口、工具块推进、确认块挂起，共用同一个「块」的概念；拆成两个事件后，落库的 `blocks` 和流出的帧之间多了一层「哪个事件对应哪个块」的映射。
+3. **加新 kind 的成本不一样。** `block` 加一个 `kind=confirm` 只是一行常量；独立事件加一个新类型就是协议变更。既然已经承认「过程帧」这一类东西存在，就该用一个帧型 + kind 表达，而不是每来一种就加一个事件。
+
+所以 `2f4a5af1` 把 `tool` 事件删掉，工具进度改用 `block{kind:tool}`，`AgentToolProgress` 里也加了 `kind` 字段。**这是一次「先分开、发现同构、再合并」的收敛**——不是设计失误，是没先看到两者的共同抽象。
+
+**为什么两套（workflow / agent）仍然分立——这是个被反复问的点，我分两层答：**
+
+1. **合并会让 RAG 契约背上不存在的状态。** 如果 RAG 也用 8 事件，那前端针对 RAG 这条流就得处理 `block` / `confirm` 两种它**永远不会收到**的事件——协议状态机里多了两条死分支。而「RAG 一条流会不会突然冒出个 confirm」这个问题，靠的是「我们保证它不发」，而不是靠协议本身能表达——这是一种**契约层面的不诚实**。
 
 2. **两套的变更风险彼此隔离。** RAG 档要加一个「拒绝」表达（`reject` 帧），不该碰 Agent 档；Agent 档要加一个「确认续跑」表达，也不该碰 RAG 档。合并成一套，任何一方的演进都要另一方陪跑回归测试。
 
-**这里有个反过来说明最省事的点：`error` 是加 type，不是加事件。** 上表 `message` 那一行，agent 档只往 body 的 `type` 里加了个 `error`，协议层一个字符没动。这就是两级结构的回报——如果当初按「每个渲染通道一个 event 名」设计，加 `error` 就得动协议（加事件名、前端 switch 加分支、评测脚本改）。现在改的只是 `TextChannel.ERROR` 一个枚举（`AgentStreamEventBridge.java:683`）。
+**这里有个反过来说明最省事的点：`error` 是加 type，不是加事件。** 上表 `message` 那一行，agent 档只往 body 的 `type` 里加了个 `error`，协议层一个字符没动。这就是两级结构的回报——如果当初按「每个渲染通道一个 event 名」设计，加 `error` 就得动协议（加事件名、前端 switch 加分支、评测脚本改）。现在改的只是 `TextChannel.ERROR` 一个枚举。
 
 **代价回顾**：两级结构让前端在 `message` 分支里多做一次 type 判断。但跟「协议演进零成本」比，这笔账划算——**协议是契约，契约的变更是最贵的**。
 
@@ -228,7 +242,7 @@ AgentScope 一轮 ReAct 会吐**十一种**事件（`AgentStreamEventBridge.onEv
 
 ### 状态：一个「当前打开的文本块」+ 一个「待广播队列」
 
-桥里维持四个关键状态（`AgentStreamEventBridge.java:126-133`）：
+桥里维持四个关键状态：
 
 ```java
 private AgentBlock openTextBlock;      // 当前未封口的文本块
@@ -239,24 +253,24 @@ private final List<AgentBlock> sealedTextBlocks = new ArrayList<>(); // 已封�
 
 **开块**（`appendTextBlock`）：增量到达时，如果当前没有同类块，就 `sealOpenTextBlock()` 封掉旧块、开一个新块（记 `at` 和 `startedAt`），然后 `openTextBuffer.append(delta)`。
 
-**封口**（`sealOpenTextBlock`，`AgentStreamEventBridge.java:582-597`）：把 `openTextBuffer` 的文本回填进 `openTextBlock.setText(...)`，然后——**关键**——不是当场发，而是**扔进 `sealedTextBlocks` 待广播队列**。
+**封口**（`sealOpenTextBlock`）：把 `openTextBuffer` 的文本回填进 `openTextBlock.setText(...)`，然后——**关键**——不是当场发，而是**扔进 `sealedTextBlocks` 待广播队列**。
 
-**那什么触发封口？** 答案在 `onEvent` 的 switch 里：**每一个「不是文本增量」的事件，第一步都是 `sealOpenTextBlock()`**。看 `onToolCallStart`（`:381`）、`onToolExecutionStart`（`:401`）、`onToolEnd`（`:443`）、`onRequireUserConfirm`（`:293`）、`onAllToolsDenied`（`:467`）——全是。因为「模型吐到一半开始调工具了」，就意味着「上段文本结束了」。这就是块的边界：**它不需要计时器，需要的是「下一种事件」当哨兵。**
+**那什么触发封口？** 答案在 `onEvent` 的 switch 里：**每一个「不是文本增量」的事件，第一步都是 `sealOpenTextBlock()`**。`onToolCallStart`、`onToolExecutionStart`、`onToolEnd`、`onRequireUserConfirm`、`onAllToolsDenied`——全是。因为「模型吐到一半开始调工具了」，就意味着「上段文本结束了」。这就是块的边界：**它不需要计时器，需要的是「下一种事件」当哨兵。**
 
 ### 锁内改状态，锁外发帧
 
-`onEvent` 的大 switch，每个分支只改内存状态，**`flushSealedTextBlocks()` 统一在 switch 之后、锁外调用**（`AgentStreamEventBridge.java:170-171`）：
+`onEvent` 的大 switch，每个分支只改内存状态，**`flushSealedTextBlocks()` 统一在 switch 之后、锁外调用**：
 
 ```java
 // onEvent 末尾
 flushSealedTextBlocks();   // 锁外发 SSE
 ```
 
-`flushSealedTextBlocks` 的逻辑（`:602-614`）：锁内 `List.copyOf(sealedTextBlocks)` 取快照 + `clear()`，锁外逐个 `sendEvent(BLOCK, ...)`。为什么必须锁外发——**SSE 发送是 IO**。持锁做 IO 会把整个事件处理串行化；更糟的是如果 `emitter.send` 阻塞（客户端不读、TCP 窗口满），所有回调线程都会卡在这把锁上。锁的持有时间只有「改几个字段 + 加进 list」，跟 IO 完全解耦。
+`flushSealedTextBlocks` 的逻辑：锁内 `List.copyOf(sealedTextBlocks)` 取快照 + `clear()`，锁外逐个 `sendEvent(BLOCK, ...)`。为什么必须锁外发——**SSE 发送是 IO**。持锁做 IO 会把整个事件处理串行化；更糟的是如果 `emitter.send` 阻塞（客户端不读、TCP 窗口满），所有回调线程都会卡在这把锁上。锁的持有时间只有「改几个字段 + 加进 list」，跟 IO 完全解耦。
 
 ### 一个最容易做错的边界：只广播有起止的块
 
-`sealOpenTextBlock` 里那行判断（`:591-596`）：
+`sealOpenTextBlock` 里那行判断：
 
 ```java
 // 只广播有起止的，一次性补发的块发空帧会让前端认错待收口块
@@ -272,17 +286,17 @@ if (sealed.getStartedAt() != null) {
 
 ### 落库为什么还要一个 `blocks` 列表
 
-`textOf(channel)`（`:546-559`）回答了「全文从哪来」：**按块序拼回**——封过口的块读 `block.getText()`，还没封口的那个块正文还没回填，读 `openTextBuffer`。落库写的是 `blocks`（JSONB），不是「发出去过的东西」。所以**发送是尽力而为，落库是必须成功**，两条路径分开——这一点跟 workflow 档是同一个原则，但 agent 档因为块结构，拼回全文多了一道「块序」的语义。
+`textOf(channel)` 回答了「全文从哪来」：**按块序拼回**——封过口的块读 `block.getText()`，还没封口的那个块正文还没回填，读 `openTextBuffer`。落库写的是 `blocks`（JSONB），不是「发出去过的东西」。所以**发送是尽力而为，落库是必须成功**，两条路径分开——这一点跟 workflow 档是同一个原则，但 agent 档因为块结构，拼回全文多了一道「块序」的语义。
 
 **埋钩子**：文本块的边界靠「下一种事件」当哨兵。那工具块呢？它的状态机更复杂，而且有个麻烦——不是每个工具调用都会收到完整的开始和结束事件。
 
 ---
 
-## Q6（追问）`tool` 事件的状态机怎么保证前端看到的状态是真的？
+## Q6（追问）工具块的状态机怎么保证前端看到的状态是真的？
 
 **面试官追问**：工具状态那么多种，你怎么保证前端卡片显示的状态跟真实执行对得上？
 
-**我**：靠一个明确的状态机 + 三个「补建」兜底 + 两个过滤/截断规则。先给状态机：
+**我**：工具进度现在走 `block` 事件、`kind=tool`，载荷是 `AgentToolProgress`。靠一个明确的状态机 + 三个「补建」兜底 + 两个过滤/截断规则。先给状态机：
 
 ```
 pending ──► running ──► done / failed
@@ -292,24 +306,26 @@ pending ──► running ──► done / failed
    └──► denied（整批被用户否决）
 ```
 
-状态在三个 `on*` 里推进：`onToolCallStart` 建块标 `pending`（`:374-389`）→ `onToolExecutionStart` 标 `running`（`:394-418`）→ `onToolEnd` 标终态（`:436-459`）。前端 `tool` 事件的 `status` 字段驱动卡片。
+状态在三个 `on*` 里推进：`onToolCallStart` 建块标 `pending` → `onToolExecutionStart` 标 `running` → `onToolEnd` 标终态。前端按 `block` 的 `kind=tool` + `status` 字段驱动卡片。
+
+**为什么不用独立事件**：`kind=tool` 的 block 和文本块共用同一套「开块 / 封口 / 广播」骨架，只是状态字段不同。合并之后，前端只有一个块列表，工具块和文本块按到达顺序排列就还原出时间线；拆成两个事件时，前端要额外做一次跨事件排序（Q4 讲过收敛过程）。
 
 **麻烦在「不是每个调用都有完整的开始/结束事件」，所以有三个补建场景：**
 
-| 场景 | 现象 | 处理（代码位置） |
+| 场景 | 现象 | 处理 |
 |---|---|---|
-| 确认续跑 | 那一轮没有 `ToolCallStart`（工具是上一轮确认后接着跑的） | `onToolExecutionStart` 里补建（`:404-408`） |
-| 完全没有开头事件 | 框架只发了结果 | `onToolEnd` 里补建 + `log.warn`（`:447-451`） |
-| 整批被拒 | 框架压根不发工具事件 | `onAllToolsDenied` 里补建（`:464-479`） |
+| 确认续跑 | 那一轮没有 `ToolCallStart`（工具是上一轮确认后接着跑的） | `onToolExecutionStart` 里补建 |
+| 完全没有开头事件 | 框架只发了结果 | `onToolEnd` 里补建 + `log.warn` |
+| 整批被拒 | 框架压根不发工具事件 | `onAllToolsDenied` 里补建 |
 
-**第三个最微妙**：整批被拒的工具**从来没有执行过**，所以给它批次号和起止时间是**撒谎**。`onAllToolsDenied` 补建时**刻意留空**这两个字段（`:473-474` 只 setStatus(DENIED)，不给 batchId 也不投影时间），前端据此显示成「未执行」，而不是「执行了 0ms」。
+**第三个最微妙**：整批被拒的工具**从来没有执行过**，所以给它批次号和起止时间是**撒谎**。`onAllToolsDenied` 补建时**刻意留空**这两个字段（只 setStatus(DENIED)，不给 batchId 也不投影时间），前端据此显示成「未执行」，而不是「执行了 0ms」。
 
 **两个过滤/截断规则：**
 
-1. **内部工具不展示**：`isInternalTool()` 过滤 `STRUCTURED_OUTPUT_TOOL_NAME`（`:538-540`），框架用结构化输出的伪工具不是用户要看的。
-2. **工具结果截断**：`TOOL_RESULT_MAX_CHARS = 64_000`（`:79`）。工具返回可能是一整篇文档，`onToolResultDelta` 里缓冲到 64K 就停（`:420-434`），超出部分既不落库也不展示——注意它是**在缓冲层截断**，不是发帧前截断，所以落库和展示天然一致（都只有 64K）。
+1. **内部工具不展示**：`isInternalTool()` 过滤 `STRUCTURED_OUTPUT_TOOL_NAME`，框架用结构化输出的伪工具不是用户要看的。
+2. **工具结果截断**：`TOOL_RESULT_MAX_CHARS = 64_000`。工具返回可能是一整篇文档，`onToolResultDelta` 里缓冲到 64K 就停，超出部分既不落库也不展示——注意它是**在缓冲层截断**，不是发帧前截断，所以落库和展示天然一致（都只有 64K）。
 
-**这里要讲一个「整批一致」的设计**（`onRequireUserConfirm` 里，`:294-299`）：
+**这里要讲一个「整批一致」的设计**（`onRequireUserConfirm` 里）：
 
 ```java
 // 整批推 awaiting，不止卡片点名的——同批都没跑，留在 pending 收尾会被判成 interrupted
@@ -320,7 +336,7 @@ for (AgentBlock opened : openToolBlocks.values()) {
 }
 ```
 
-一批并行工具，如果只有点名要确认的那个推成 `awaiting`、其余留在 `pending`，那收尾时（`settleBlocks` 把开着的工具块改成 `interrupted`）这批 `pending` 会被判成「被中断」——显示上就像「这些工具被中断了」，而实际上它们是被一起挂起等用户裁决的。所以**同一批的状态要一起推**。前端 `agentTimeline.ts` 里 `batchWaiting` 字段对应的就是这个语义（`agentTimeline.ts:333-337`）：批里那些「随批等、但不是它自己要你点头」的工具，显示成「随批等待」而不是「待确认」。
+一批并行工具，如果只有点名要确认的那个推成 `awaiting`、其余留在 `pending`，那收尾时（`settleBlocks` 把开着的工具块改成 `interrupted`）这批 `pending` 会被判成「被中断」——显示上就像「这些工具被中断了」，而实际上它们是被一起挂起等用户裁决的。所以**同一批的状态要一起推**。前端 `agentTimeline.ts` 里 `batchWaiting` 字段对应的就是这个语义：批里那些「随批等、但不是它自己要你点头」的工具，显示成「随批等待」而不是「待确认」。
 
 **埋钩子**：工具块的 `startedAt`/`endedAt` 是从哪来的？你可能会想「桥自己 `System.currentTimeMillis()` 打一下不就行了」——这正是下一个问题要推翻的。
 
@@ -330,7 +346,7 @@ for (AgentBlock opened : openToolBlocks.values()) {
 
 **面试官追问**：桥自己取个 `System.currentTimeMillis()` 不简单吗？为什么要绕一道？
 
-**我**：因为**同一个事实如果有两个算法，迟早会算出两个值**。这是 `AgentToolExecutionFacts` 类注释的原话（`AgentToolExecutionFacts.java:35`）：
+**我**：因为**同一个事实如果有两个算法，迟早会算出两个值**。这是 `AgentToolExecutionFacts` 类注释的原话：
 
 > trace、SSE、PG、前端一律读这里，不各自复算——同一个事实有两个算法，迟早会算出两个值
 
@@ -338,7 +354,7 @@ for (AgentBlock opened : openToolBlocks.values()) {
 
 这个类是一个 run 内「执行事实」的**唯一生成者**：run 起点、批次号、组内序号、单工具真起止、两条中断时刻，都只在这里产生一次。工具体（真正执行工具的地方）通过 `RuntimeContext` 拿到这个实例（`RUNTIME_CONTEXT_KEY = "ragent_tool_execution_facts"`），在执行前后调 `markStarted(toolCallId)` / `markEnded(toolCallId)`。
 
-**桥的角色是投影，不是测量。** 看 `applyExecutionTimes`（`AgentStreamEventBridge.java:509-519`）：
+**桥的角色是投影，不是测量。** 看 `applyExecutionTimes`：
 
 ```java
 private void applyExecutionTimes(AgentBlock block) {
@@ -358,13 +374,13 @@ private void applyExecutionTimes(AgentBlock block) {
 
 1. **否则两套口径。** 工具事件的时间来自工具体，块事件的时间来自桥，两者中间有调度延迟，前端会把同一个工具在「工具卡片」和「文本块」里显示成两个不同的耗时。用户问「这俩为什么不一样」，答不上来。
 
-2. **有的调用永远拿不到真时刻。** 没真执行过的调用（整批被拒、确认前挂起）没有起止可投影。所以 `durationMs` 的取值逻辑是**两端缺一返回 null**（`ToolFact.durationMs`，`:296-300`），`durationSource` 这个字段告诉前端「这个耗时是 `tool`（真测量）还是 `batch`（整批共享）」。前端据此决定「没测到的就不显示」，而不是显示个 0 误导人。
+2. **有的调用永远拿不到真时刻。** 没真执行过的调用（整批被拒、确认前挂起）没有起止可投影。所以 `durationMs` 的取值逻辑是**两端缺一返回 null**，`durationSource` 这个字段告诉前端「这个耗时是 `tool`（真测量）还是 `batch`（整批共享）」。前端据此决定「没测到的就不显示」，而不是显示个 0 误导人。
 
-3. **重试和重复订阅不能改时刻。** `markStarted`/`markEnded` 都用 `compareAndSet(0L, now)` CAS 定格（`:162-179`）——重试、重复订阅都不会覆盖已经定格的起止。这个「CAS 一次」的模式贯穿整个类：`settleRun()`（`:97-100`）、`markInterrupted`/`markCancelled`（`:204-213`）都是。为什么用 CAS 而不是锁——因为这些调用散在工具体、中间件、桥、收尾四个地方，可能并发到达，CAS 比锁轻且语义就是「第一次说了算」。
+3. **重试和重复订阅不能改时刻。** `markStarted`/`markEnded` 都用 `compareAndSet(0L, now)` CAS 定格——重试、重复订阅都不会覆盖已经定格的起止。这个「CAS 一次」的模式贯穿整个类：`settleRun()`、`markInterrupted`/`markCancelled` 都是。为什么用 CAS 而不是锁——因为这些调用散在工具体、中间件、桥、收尾四个地方，可能并发到达，CAS 比锁轻且语义就是「第一次说了算」。
 
 ### 中断时刻也是「两条路径互斥、取先写入的」
 
-`terminationAt()`（`:226-236`）是给「断在半路的工具」补终点的：优雅中断和强制断流各有一个时刻（`interruptedAt` / `cancelledAt`），两条路径互斥，取先写入的那个。工具 `markTerminated`（`:185-190`）就用它——**断在半路的工具，终点不是「此刻」，而是「全局那个中断时刻」**，这样整条时间线里「谁在几点断的」是一致的。
+`terminationAt()` 是给「断在半路的工具」补终点的：优雅中断和强制断流各有一个时刻（`interruptedAt` / `cancelledAt`），两条路径互斥，取先写入的那个。工具 `markTerminated` 就用它——**断在半路的工具，终点不是「此刻」，而是「全局那个中断时刻」**，这样整条时间线里「谁在几点断的」是一致的。
 
 **代价说清楚**：桥变复杂了——它得接受「有的调用永远拿不到真时刻」，并维护「哪些块有真时刻、哪些是补建的」。但这个复杂度换来了**时间线在 SSE / trace / PG / 前端四处的一致性**。前端的 `agentTimeline.ts` 把这条原则贯彻到了极致：文件头注释直接写「状态、批次、序号、执行耗时全部照抄服务端——**这里一个都不推断，也不碰 Date.now()**」。
 
@@ -376,11 +392,11 @@ private void applyExecutionTimes(AgentBlock block) {
 
 **面试官追问**：正常完成、出错、被取消，三条路可能同时到，你怎么保证收尾只做一次？
 
-**我**：靠一个「可重入锁 + settled 标志」的组合，把**整段收尾体**包成一个原子块。先看三条出口（`AgentRunHandle.java:223-242`）：
+**我**：靠一个「可重入锁 + settled 标志」的组合，把**整段收尾体**包成一个原子块。先看三条出口：
 
 ```java
 public void complete(Runnable body) { settleAndClose(body); }
-public void cancel(Runnable body)   { settleAndClose(body); }
+public void cancel(Runnable body)   { settleAndClose(() -> { stateSaveRequired = true; body.run(); }); }
 public void fail(Runnable body)     { settleAndClose(() -> { stateSaveRequired = true; body.run(); }); }
 ```
 
@@ -404,19 +420,24 @@ private boolean settle(Runnable body) {
 
 ### 三个关键设计
 
-**一，锁必须可重入。** 注释写死了原因（`:57`）：「必须可重入：同步结束的流会在订阅那一刻就回调收尾」。什么意思——AgentScope 有些场景会在 `subscribe` 的**同一个调用栈里**就同步触发 `onComplete`，这时候收尾发生在 `start()` 还持着 `lifecycleLock` 的时候。如果锁不可重入，同一个线程进 `settle` 会自己把自己锁死。
+**一，锁必须可重入。** 注释写死了原因：「必须可重入：同步结束的流会在订阅那一刻就回调收尾」。什么意思——AgentScope 有些场景会在 `subscribe` 的**同一个调用栈里**就同步触发 `onComplete`，这时候收尾发生在 `start()` 还持着 `lifecycleLock` 的时候。如果锁不可重入，同一个线程进 `settle` 会自己把自己锁死。
 
 **二，`settled` 是「谁先抢到谁收尾」。** 三条出口无论谁先到，抢到锁的置 `settled=true`、跑收尾体；后来者看到 `settled` 直接返回 `false`。收尾体（发终态帧 + 落库）**恰好只跑一次**，不会出现「finish 和 cancel 都发了一遍」。
 
-**三，释放钩子「每个只跑一次，收尾后再登记当场补跑」。** `onRelease`（`:146-157`）和 `runReleaseHooks`（`:280-285`）——钩子列表在收尾时遍历执行，之后 `clear()` 掉；如果收尾**之后**才 `onRelease` 登记一个新钩子，走「补跑」分支当场执行，不进列表。为什么要有这个语义：因为钩子的登记顺序就是释放顺序，而释放动作有先后依赖（Q9 讲「先补存盘、再放闸门、最后抽记忆」），不能因为「登记晚了」就跳过。
+**三，释放钩子「每个只跑一次，收尾后再登记当场补跑」。** `onRelease` 和 `runReleaseHooks`——钩子列表在收尾时遍历执行，之后 `clear()` 掉；如果收尾**之后**才 `onRelease` 登记一个新钩子，走「补跑」分支当场执行，不进列表。为什么要有这个语义：因为钩子的登记顺序就是释放顺序，而释放动作有先后依赖（Q9 讲「先补存盘、再放闸门、最后抽记忆」），不能因为「登记晚了」就跳过。
 
 ### 为什么 `start()` 也要放锁里——回到 Q1 那个竞态
 
-`start(Runnable startup)`（`:126-141`）整段在锁里，且第一句就判 `isSettled() || isCancelled()`。这就是 Q1 说的：**取消可能先跑完收尾、这边随后才订阅，工具照样被执行一遍**。把「订阅 + 绑定取消动作」和「取消收尾」放进同一把锁，这个竞态窗口从根上不存在。
+`start(Runnable startup)` 整段在锁里，且第一句就判 `isSettled() || isCancelled()`。这就是 Q1 说的：**取消可能先跑完收尾、这边随后才订阅，工具照样被执行一遍**。把「订阅 + 绑定取消动作」和「取消收尾」放进同一把锁，这个竞态窗口从根上不存在。
 
-### 一个细节：`fail` 和 `complete/cancel` 的区别
+### 一个细节：`stateSaveRequired` 为什么 `cancel` 和 `fail` 都置
 
-`fail` 的收尾体多包了一层 `stateSaveRequired = true`（`:237-242`）。为什么——出错时框架**大概率没来得及存盘**，释放钩子里的「补存盘」逻辑（Q9）要看这个标志决定要不要补。而 `complete`/`cancel` 不置，因为正常完成框架已经存了，优雅取消也会先让框架存（Q9）。**这个标志决定了「错误路径和强制断流要不要在驱逐前补存一次」。**
+`cancel` 和 `fail` 的收尾体都多包了一层 `stateSaveRequired = true`。为什么：
+
+- **`fail`（出错）**：框架大概率没来得及存盘，释放钩子里的「补存盘」逻辑（Q9）要看这个标志决定要不要补。
+- **`cancel`（取消）**：取消走的是 `interruptUpstream()`——先优雅打断、等框架存盘。**如果等到了**，框架自己存了，补存盘是空操作；**如果没等到**（2 秒超时强断），框架没存，必须补。所以 `cancel` 也置这个标志——它不知道优雅中断到底成没成，**宁可按「需要补存」处理**。补存一次的开销远小于丢状态。
+
+`complete` 不置，因为正常完成框架一定已经存了。
 
 **埋钩子**：三条出口的「谁先到」问题解决了。但「取消」这件事，Agent 档比 workflow 档多了一个完全不同的动作——**打断框架、等它存盘**。
 
@@ -428,7 +449,7 @@ private boolean settle(Runnable body) {
 
 **我**：因为 **AgentScope 有跨轮状态要持久化**。workflow 档取消，把 `cancelled` 置上、不再发帧、把已累积内容落库就完了——因为那一轮没有「引擎状态」要保护。Agent 档不一样：这一轮里的工具执行结果、ReAct 的中间思考，都还在 AgentScope 的内存状态里，**直接断流会把这些全部丢掉，下一轮用户追问「你刚才查到了什么」时，模型失忆了**。
 
-所以取消分两段：**先优雅打断、等框架存盘，超时才强制断流**。看 `interruptUpstream()`（`AgentRunHandle.java:169-204`）：
+所以取消分两段：**先优雅打断、等框架存盘，超时才强制断流**。看 `interruptUpstream()`：
 
 ```java
 public void interruptUpstream() {
@@ -445,13 +466,13 @@ public void interruptUpstream() {
 }
 ```
 
-`awaitUpstreamTermination` 就是 Q2 那个 `CountDownLatch`——`GRACEFUL_INTERRUPT_WAIT_MS = 2000L`（`:43`），`doFinally(markUpstreamTerminated)` 在框架流结束时 `countDown()`。**2 秒是拿什么换的**：打断后框架要执行完「存盘」这个收尾动作，我们等它最多 2 秒；2 秒没等到，说明框架卡住了，才 `dispose()` 强断流，并置 `stateSaveRequired=true` 让释放钩子兜底补存（`AgentChatServiceImpl.java:270-278` 里 `agent.saveAgentState`）。
+`awaitUpstreamTermination` 就是 Q2 那个 `CountDownLatch`——`GRACEFUL_INTERRUPT_WAIT_MS = 2000L`，`doFinally(markUpstreamTerminated)` 在框架流结束时 `countDown()`。**2 秒是拿什么换的**：打断后框架要执行完「存盘」这个收尾动作，我们等它最多 2 秒；2 秒没等到，说明框架卡住了，才 `dispose()` 强断流，并置 `stateSaveRequired=true` 让释放钩子兜底补存。
 
-**顺序不能反**——注释（`:167`）：「先打断框架、等它存盘，超时再 dispose 断流；顺序反了会丢掉本轮 Agent 状态」。如果先 `dispose`，流直接被掐，框架连「存盘」这个动作都来不及做。
+**顺序不能反**——注释：「先打断框架、等它存盘，超时再 dispose 断流；顺序反了会丢掉本轮 Agent 状态」。如果先 `dispose`，流直接被掐，框架连「存盘」这个动作都来不及做。
 
 ### 取消信号的源头：三个容器回调归一到同一个动作
 
-`bindEmitterLifecycle`（`AgentChatServiceImpl.java:367-379`）：
+`bindEmitterLifecycle`：
 
 ```java
 AtomicBoolean recycled = new AtomicBoolean(false);
@@ -469,73 +490,72 @@ emitter.onCompletion(recycleUpstream);   // 关页走 completeWithError，只有
 
 ### 释放钩子的顺序是有依赖的
 
-`bindReleaseHooks`（`:266-286`）登记了三件事，注释反复强调「换顺序会出问题」：
+`bindReleaseHooks` 登记了三件事，注释反复强调「换顺序会出问题」：
 
 1. **补存盘**（若 `stateSaveRequired`）+ `clearStateCache`——「只清本次流实际使用的实例，避免重建后旧流误清新 Agent」；
-2. **放闸门** `releaseGate`——「最后再放行同一用户的下一轮，避免新流加载状态后被本轮收尾清掉」；
+2. **放闸门** `releaseGate`——「最后再放行同一会话的下一轮，避免新流加载状态后被本轮收尾清掉」；
 3. **抽记忆** `scheduleMemoryExtraction`——「放在释放并发锁之后，确保记忆抽取时名额已归还」。
 
-**顺序为什么重要**：如果先放闸门再清缓存，新流可能已经加载了状态、然后被旧流的 `clearStateCache` 清掉——一个用户「下一轮」抢到闸门后立刻拿到的是一份被清掉的状态。所以「清缓存」在「放闸门」**之前**，而「抽记忆」在最后（它是异步的，不阻塞主收尾）。
+**顺序为什么重要**：如果先放闸门再清缓存，新流可能已经加载了状态、然后被旧流的 `clearStateCache` 清掉——用户「下一轮」抢到闸门后立刻拿到的是一份被清掉的状态。所以「清缓存」在「放闸门」**之前**，而「抽记忆」在最后（它是异步的，不阻塞主收尾）。
 
 **埋钩子**：取消这条链路讲完了。但「取消」和「出错」之外，还有一个更早的拦截——**根本不让流建起来**的那个闸门。
 
 ---
 
-## Q10（追问）`AgentRunGate` 按用户闸门为什么先于一切副作用？
+## Q10（追问）`AgentRunGate` 为什么先于一切副作用？它为什么从「用户级单流」改成「会话互斥 + 每用户名额」？
 
 **面试官追问**：workflow 档已经有 `@IdempotentSubmit` 了，Agent 档为什么还要再做一个闸门？
 
-**我**：因为两者的**覆盖窗口**不一样，而 Agent 档必须覆盖整个流生命周期。先看 `@IdempotentSubmit` 和 `AgentRunGate` 的分工（`AgentRunGate.java:32-34` 的类注释）：
+**我**：因为两者的**覆盖窗口**不一样，而 Agent 档必须覆盖整个流生命周期。`@IdempotentSubmit` 覆盖的是「控制器返回 emitter 之前」的同步窗口；`AgentRunGate` 覆盖**从建流到收尾的全部时间**（一条流跑多久，闸门占多久）。
 
-> 用户维度的 Agent 并发闸门：一个用户同一时刻只跑一条流。与 @IdempotentSubmit 的区别是覆盖整个流生命周期，而非控制器返回 emitter 前的同步窗口
-
-### 实现：Redis 抢占运行位
-
-`acquire`（`:53-60`）：
+### 现在是两层锁：会话互斥 + 每用户名额
 
 ```java
-String slotValue = taskId + "|" + conversationId;
-RBucket<String> slot = redissonClient.getBucket("ragent:agent:running:" + userId);
-if (!slot.setIfAbsent(slotValue, ttl())) {
-    throw new ClientException("当前会话处理中，请稍后再发起新的对话");
-}
-return () -> release(userId, slotValue);
+// 每一把都是 Redisson RLock，无显式租期，由看门狗续期
+RLock conversationLock = redissonClient.getLock("ragent:agent:run-lock:" + userId + ":" + conversationId);
+RLock permit           = redissonClient.getLock("ragent:agent:run-permit:" + userId + ":" + slot); // slot = 0..N-1
 ```
 
-`setIfAbsent` 是**原子的**——多个节点上同一个用户的并发请求，只有一个能抢到。抢到的拿回一个 `release` 闭包（挂在收尾释放钩子上），抢不到的抛 `ClientException`。
+- **会话锁**：同一个 `(userId, conversationId)` 同一时刻只跑一条流。这是硬互斥——同会话并发写框架状态会直接串。
+- **用户名额锁**：同一个用户最多 `agent.max-concurrent-runs-per-user`（默认 **5**）条流并行。做法是抢 `0..N-1` 里的一个槽位，抢到即持有，释放即归还。
+- 两把锁都用 `tryLockAsync(owner)`，**不等待**，抢不到立即返回失败。
+- **不设 TTL**，靠 Redisson 看门狗自动续期；进程正常结束走 `unlockAsync(owner)`，进程崩溃则看门狗停止续期后由 Redisson 释放。
+- `owner` 是本次 run 的唯一标识，**只解自己那把**。
 
-**为什么「先于一切副作用」**：看 `streamChat` 的顺序（`AgentChatServiceImpl.java:85-98`）——`runGate.acquire()` 是**第一件事**，`touchConversation` / `ensureBaseline` / `addUserMessage` 这些落库都在它**之后**。所以被拒的请求**不留任何脏数据**（没有半建成的会话、没有落库的空消息）。这点跟 workflow 档「META 先发、拒绝只能走流内」形成对比：**Agent 档把拒绝提前到了建流之前，所以不需要 reject 帧**。
+抢不到任一层的处理：抛 `ClientException`，**META 还没发**，全局异常处理器返回干净的 JSON 错误。
 
-### 两个细节，都关于「别误伤」
+### 为什么从「一个用户一条流」改成现在这样
 
-**一，`release` 用 `compareAndSet(slotValue, null)` 而不是无条件删**（`:83-86`）：
+第一版是「用户级运行位」——Redis `RBucket.setIfAbsent` 抢一个位，同一个用户同一时刻只能跑一条流，配置了 TTL = SSE 超时 × 2 兜底进程崩溃，`release` 用 `compareAndSet` 只放自己的位。
+
+这套能跑，但有两个问题：
+
+1. **太严。** 用户在两个会话里并行问两件事是合理需求——一个会话在等工具，另一个会话完全可以继续问。用户级单流把这个正常场景也挡了，而且挡得没有任何必要：真正需要互斥的是**同一个会话**，因为那是同一份框架状态。
+2. **TTL 是个不可靠的兜底。** 旧方案靠「TTL 到期自动释放」处理进程崩溃，但 TTL 同时是误伤源——一条活得很久的流可能被 TTL 提前挤掉，然后同一用户的新流抢进来，旧流收尾时还得靠 `compareAndSet` 判断「这个位还是不是我的」。**用一个会误伤活流的机制去兜死进程，本身就是拧的。**
+
+现在的方案把两件事拆开：
+
+- **正确性**靠**会话锁**——粒度精确到「同一份框架状态」，这是真正不能并行的东西；
+- **资源保护**靠**名额锁**——每用户 5 条，防止单个用户把实例打满；
+- **进程崩溃**靠**看门狗**——Redisson 的看门狗只在客户端活着时续期，进程一死续期停止、锁自动过期。这比「固定 TTL」精确：**活着的流一直被续期（不会被误放），死掉的流停止续期（自然释放）**。
+
+而且锁的释放从「`compareAndSet` 判断值」变成了「`unlockAsync(owner)` 解自己的锁」——Redisson 的锁本身带持有者标识，不需要应用层再拼 `taskId|conversationId` 去比。旧方案里那个 `runningTaskId()`（拆开运行位里的 `taskId|conversationId` 判断「在跑的是不是这个会话」）也随之不需要了——**锁的 key 里本来就有 conversationId**。
+
+### 追问：放开到会话级并行，记忆那层怎么跟着改？
+
+这是这次改造里真正需要想清楚的一点：**闸门从「用户级」放宽到「会话级 + 名额」，而长期记忆是用户级的**——`t_agent_memory` 的条目按 `userId` 归属，没有 `conversation_id`。
+
+**如果什么都不做，两个会话并行跑，收尾时的记忆抽取会同时改这个用户级的记忆集。** 现在的兜法是**记忆侧自己有一把用户级锁**：
 
 ```java
-// 只放自己占的位：运行位若被 TTL 挤掉又被下一轮抢走，无条件删会把别人的闸门放掉
-slot.compareAndSet(slotValue, null);
+RLock lock = redissonClient.getLock("ragent:agent:memory-lock:" + userId);
 ```
 
-如果这条流跑得太久，TTL 到期把运行位挤掉了，紧接着同一用户的新一轮又 `setIfAbsent` 抢到了新的位——这时候旧流收尾，如果无条件 `delete`，就把**新流的闸门**放掉了，用户就能再并发一条流。`compareAndSet` 只在「值还是我当年写的那个」时才清，值对不上就是空操作。
+`AgentMemoryLearner`（后台学习）和 `AgentMemoryFlusher`（主动整理）**共用同一把锁**，拿不到就返回 `BUSY`、留给下次触发。所以并行的两条流可以同时跑完，但它们的记忆写是**串行的**——一个在整理时，另一个让位。
 
-**二，TTL 取 SSE 超时的两倍**（`:92-94`）：
+这跟旧方案的区别在于**错误处理方式**：旧方案是「乐观锁撞了 → 整批 CONFLICT 丢弃 → judge 白跑」；现在是「拿不到锁 → 根本不调 judge → 不浪费模型调用」。**用悲观锁把冲突挡在模型调用之前**，比「先算了再作废」便宜。
 
-```java
-// 进程崩溃时没人来释放，TTL 是唯一出路
-// 取 SSE 超时的两倍：长过任何一条活着的流，又不至于把用户挡到下个小时
-Duration.ofMillis(agentProperties.getSseTimeoutMs() * 2);
-```
-
-进程崩溃时没有代码来调 `release`，TTL 是唯一兜底。取 2×（即 30 分钟）——长过任何一条活着的流（SSE 本身 15 分钟超时），又不会把用户挡到天荒地老。
-
-### 还有一个配套：`runningTaskId` 认出「在跑的是不是这个会话」
-
-`runningTaskId(userId, conversationId)`（`:66-77`）把运行位里的 `taskId|conversationId` 拆开比对——**删会话的时候要凭它认出在跑的是不是这一个**。运行位里存 `taskId|conversationId` 而不是只存 taskId，就是为了「删除会话」这个操作能判断「这条正在跑的流是不是属于要删的那个会话」。两段都是雪花数字串、不含竖线，所以 `|` 分割安全。
-
-### 追问：如果放开到「user + 会话」并行，记忆那层怎么跟着改？
-
-闸门选**用户级**还有一个更深的原因没在 Q10 正面讲：**记忆也是用户级的**。`t_agent_memory` 没有 `conversation_id`，`t_agent_memory_control` 用 `userId` 做行锁 + `revision` 乐观锁。如果闸门放开到 user+会话——两个会话并行跑——那两条流收尾时的**记忆抽取会同时改这个用户级记忆集**，`revision` 一撞就 `rejectAsConflict` 整批丢弃、judge 白跑。所以「闸门按用户」和「记忆按用户」是**同一个粒度的同一次取舍**：先串行，把并发的复杂度挡在门外。
-
-**如果真要放开，业界的解法按四条路线记**（完整展开见《记忆系统的三层架构.md》Q5.1）：
+**如果哪天要把记忆写也放开成并行**，业界的解法是四条路线（完整展开见《记忆系统的三层架构.md》）：
 
 | 路线 | 核心 | 代表 |
 |---|---|---|
@@ -544,9 +564,9 @@ Duration.ofMillis(agentProperties.getSseTimeoutMs() * 2);
 | 拆层 | 抽取并行，合并串行（小临界区） | Zep（异步抽取 + 图库事务兜合并） |
 | 事件溯源 | 变更 = 不可变事件，最终态折叠 | Event Sourcing / CQRS |
 
-**落到我们这，其实已经做对了一半。** judge 在事务外（并行）、commit 进 `selectForUpdate(userId)` 短事务（串行）、`SUPERSEDE`/`RETRACT` 已经是 per-item 条件更新（`!=1 → 丢弃`）。**唯一浪费是 commit 顶部的 `revision` 整批拒绝**——两个会话就算改的是不相干的两条记忆，也会被整批 CONFLICT。所以最小改动是：把「冲突 → 整批丢弃」换成「冲突 → 锁内重放」（per-item 条件更新天然可重放，judge 不重跑）；要并行就进一步把「决策（judge，并行）」和「投影（用户级串行合并器）」分开。
+**落到我们这，其实已经在往第二条路走。** Judge 在事务外（可以并行）、提交用**游标 CAS**（`last_message_id IS NOT DISTINCT FROM expected`）挡住「同一批被提交两次」、每条记忆的 UPDATE/DELETE 是**条件更新**（影响行数不为 1 就整批回滚）。现在差的只是「两个不同批次的决策基于同一份旧快照」这一种冲突——它由用户锁兜住，而不是靠版本号重放。
 
-**这也是「现在按用户闸门是保守但正确」的判断依据**：等记忆这层把「冲突重放」做扎实，闸门才敢放宽到会话级——**闸门粒度和记忆粒度的放宽，是同一张路线图上先后两步，不是两件事。**
+**一句话**：**闸门粒度和记忆粒度的放宽，是同一张路线图上先后两步**——先把会话级并行放开（已经做了），记忆写仍是用户级串行（现在这样），等记忆侧把「冲突可重放」做扎实，再考虑记忆写并行。
 
 **埋钩子**：闸门挡住了「并发提问」。但还有另一种「这条流必须停下来」——不是被取消，是**停下来等用户裁决一个写操作**。
 
@@ -566,28 +586,43 @@ Agent 走 ReAct 循环，中间可能遇到需要人工裁决的写操作（比�
 - **不能什么都不发**——前端在等，没有任何事件会以为卡死；
 - **不能关连接**——关了用户点「同意」之后没地方接续。
 
-所以 `confirm` 事件的语义是：**流还在，但主动权交给用户**。载荷 `AgentConfirmPayload(messageId, title, calls, durationMs)`，其中 `calls` 是 `AgentConfirmCall(toolCallId, name, displayName, fields, arguments)`，`fields` 是 `AgentConfirmField(name, label, value)`——**前端渲染的是 `label` 和 `value`（给人看的），`arguments` 是原始参数**。
+所以 `confirm` 事件的语义是：**流还在，但主动权交给用户**。载荷 `AgentConfirmPayload(messageId, title, calls, durationMs)`，其中 `calls` 是 `AgentConfirmCall(toolCallId, name, displayName, fields, arguments)`，`fields` 是 `AgentConfirmField(name, label, value)`——**前端渲染的是 `label` 和 `value`（给人看的），`arguments` 是原始参数**。同批还会发一个 `block{kind:confirm, status:pending}`，前端据此把卡片插进时间线。
 
-**消息状态落 `AWAITING_CONFIRM`**，这是 Agent 消息状态里**唯一非终态**的状态。并且有 `hasPendingConfirm` 挡住新提问——不然用户在待确认状态里再问一句，会话状态就乱了（这就是 Q1 入口那个「上一步操作还在等你确认」的检查，`AgentChatServiceImpl.java:94-96`）。
+**消息状态落 `AWAITING_CONFIRM`**，这是 Agent 消息状态里**唯一非终态**的状态。并且有 `hasPendingConfirm` 挡住新提问——不然用户在待确认状态里再问一句，会话状态就乱了（这就是 Q1 入口那个「上一步操作还在等你确认」的检查）。
 
-### 三个出口都要判 `settleAwaitingConfirm()`
+### 两个出口判 `settleAwaitingConfirm()`，第三个出口不判
 
-这是这一块最重要的一条设计判断。`onComplete` / `onError` / `finishCancelledStream`——**三个出口第一件事都是判它**：
+`onComplete` 和 `finishCancelledStream`——**这两个出口第一件事都是判它**：
 
 ```java
-// onComplete 里（AgentStreamEventBridge.java:180-183）
+// onComplete 里
 if (settleAwaitingConfirm()) {
     return;   // 已按确认流程收尾，不走 finish
 }
 ```
 
-**为什么三个出口都要判**：因为「这一轮正卡在等确认」这个状态，跟「这一轮怎么结束的」是**正交**的。正常跑完到了确认点、出错了、被取消了——三种情况下那个待确认的写操作**都还在那儿**，都该走确认流程，而不是被判成 `INTERRUPTED` 丢掉。
+```java
+// finishCancelledStream 里
+runHandle.cancel(() -> {
+    if (settleAwaitingConfirm()) {
+        return;
+    }
+    ...
+});
+```
 
-**一句话记住**：**用户取消的是「这次流」，不是「这个待确认动作」**。他不想再等这个回答往下生成，但那个尚未执行的写操作应该留着让他决定。而且工具与入参是从 `t_agent_state` 取当初那条原件（前端只传 `approved=true/false`），确认这条路本来就不依赖流还在不在。
+**为什么是这两个**：
+
+- **`onComplete`**：框架发完 `REQUIRE_USER_CONFIRM` 后，这一轮的流是**正常结束**的（不是出错、不是取消），所以确认挂起必然从 `onComplete` 出去。
+- **`finishCancelledStream`**：用户等得不耐烦点了停止。这时那个待确认的写操作**还在那儿**——**用户取消的是「这次流」，不是「这个待确认动作」**。他不想再等这个回答往下生成，但那个尚未执行的写操作应该留着让他决定。而且工具与入参是从 `t_agent_state` 取当初那条原件（前端只传 `approved=true/false`），确认这条路本来就不依赖流还在不在。
+
+**为什么 `onError` 不判**：`pendingConfirmCalls` 只在本轮收到 `REQUIRE_USER_CONFIRM` 之后才有值，而框架发出这个事件之后会把流**正常结束**、走 `onComplete`。也就是说「挂着等确认」和「流报错」这两条路在框架层面是互斥的——真走到 `onError`，说明这一轮已经异常终止，没有挂起态要保。这时按 `INTERRUPTED` 落库，确认端点那边会因为没有 `AWAITING_CONFIRM` 的 pending 卡片而返回「待确认的操作已失效，请重新提问」。
+
+> 这里跟旧版的一个差别：第一版是「三个出口都判」，后来对着框架的实际行为收成了两个。**判据是「这个出口在框架里到底会不会带着挂起态到达」，不是「多判一次更保险」**——多判的那次在 `onError` 里永远不会命中，留着只会让人误以为出错也能续跑。
 
 ### 落库失败的第二层降级
 
-`settleAwaitingConfirm` 里如果 `settleAndPersistMessage` 拿到 null（落库失败），走 `settleUnpersistedConfirm()`（`:363-369`）：
+`settleAwaitingConfirm` 里如果 `settleAndPersistMessage` 拿到 null（落库失败），走 `settleUnpersistedConfirm()`：
 
 发 `hint`（「系统繁忙，这一步没有执行；这条会话已无法继续，请新建会话重试」）+ `finish(INTERRUPTED)` + `done`。
 
@@ -609,12 +644,12 @@ if (settleAwaitingConfirm()) {
 |---|---|---|
 | 入口 | `GET /agent/v1/chat` | `POST /agent/v1/chat/confirm` |
 | 输入 | `question`（用户文本） | `conversationId + messageId + approved`（布尔） |
-| 前置 | `touchConversation` + `addUserMessage` | `getPendingConfirm` + `resolveConfirmResultsOrExpire` |
+| 前置 | `hasPendingConfirm` → `touchConversation` → `ensureCursor` → `addUserMessage` | `getPendingConfirm` + `resolveConfirmResultsOrExpire` |
 | 给 Agent 的 Msg | `UserMessage(question)` | **空正文** `UserMessage` + metadata |
 
 ### 两个关键设计
 
-**一，工具入参从 Agent 状态重取，前端只传 `approved`。** `resolveConfirmResultsOrExpire`（`AgentChatServiceImpl.java:189-200`）：
+**一，工具入参从 Agent 状态重取，前端只传 `approved`。** `resolveConfirmResultsOrExpire`：
 
 ```java
 List<ToolUseBlock> asking = askingToolCalls(agent.getAgentState(userId, conversationId).getContext());
@@ -625,9 +660,9 @@ if (asking.isEmpty()) {
 return asking.stream().map(toolCall -> new ConfirmResult(approved, toolCall)).toList();
 ```
 
-**前端永远只传一个 `approved: true/false`，具体的工具名和参数一律从 Agent 的持久化状态里重取。** 为什么——如果前端回传完整参数，攻击者就能在确认卡片上**篡改**一个写操作的入参（把「关单 A」改成「关单 B」）。让参数从服务端状态取，前端就没有篡改的入口。这就是注释（`:187`）说的「工具入参从 Agent 状态取，前端只传同意/拒绝，防止篡改」。
+**前端永远只传一个 `approved: true/false`，具体的工具名和参数一律从 Agent 的持久化状态里重取。** 为什么——如果前端回传完整参数，攻击者就能在确认卡片上**篡改**一个写操作的入参（把「关单 A」改成「关单 B」）。让参数从服务端状态取，前端就没有篡改的入口。这就是注释说的「工具入参从 Agent 状态取，前端只传同意/拒绝，防止篡改」。
 
-**二，续跑的消息是「空正文 + metadata」的。** `startConfirmRun`（`:163-184`）：
+**二，续跑的消息是「空正文 + metadata」的。** `startConfirmRun`：
 
 ```java
 Msg resumeMsg = UserMessage.builder()
@@ -635,11 +670,11 @@ Msg resumeMsg = UserMessage.builder()
         .build();
 ```
 
-注释（`:169`）：「空正文消息仅携带确认/拒绝结果，框架不会把它并进对话上下文」。**裁决结果不是一条「用户说了什么」，它是给框架的「你刚才要确认的那批工具，现在执行/否决」的指令**。用 metadata 而非正文承载，框架才知道「这不是一条要展示给模型看的用户消息」。
+注释：「空正文消息仅携带确认/拒绝结果，框架不会把它并进对话上下文」。**裁决结果不是一条「用户说了什么」，它是给框架的「你刚才要确认的那批工具，现在执行/否决」的指令**。用 metadata 而非正文承载，框架才知道「这不是一条要展示给模型看的用户消息」。
 
 ### 一个顺序上的微妙点：先结算卡片，再订阅
 
-`settleConfirmCard` 是在 `runHandle.start()` 的锁内、`subscribe` **之前**调的（`AgentChatServiceImpl.java:250-251`）。注释（`:308-309`）：
+`settleConfirmCard` 是在 `runHandle.start()` 的锁内、`subscribe` **之前**调的。注释：
 
 > 只能在启动互斥区里做：先结算后订阅，取消才不会漏掉这次工具执行
 
@@ -647,7 +682,7 @@ Msg resumeMsg = UserMessage.builder()
 
 ### 还有一个过期兜底
 
-`resolveConfirmResultsOrExpire` 里，如果状态里**已经没有待确认工具了**（用户点了两次、或者确认态被别处结算了），先 `expirePendingConfirm`（把卡片改成终态）再抛「待确认的操作已失效，请重新提问」——注释（`:195`）：「先结算卡片再报错，否则会话会一直卡住」。
+`resolveConfirmResultsOrExpire` 里，如果状态里**已经没有待确认工具了**（用户点了两次、或者确认态被别处结算了），先 `expirePendingConfirm`（把卡片改成终态）再抛「待确认的操作已失效，请重新提问」——注释：「先结算卡片再报错，否则会话会一直卡住」。
 
 **埋钩子**：讲完了正常、取消、确认三条路。最后一个是「半路出错」——那些已经生成的内容、已经执行过的工具，怎么保证落库和流出的是同一份？
 
@@ -661,7 +696,7 @@ Msg resumeMsg = UserMessage.builder()
 
 ### 先看 onError：为什么 error 是「单独一个块」
 
-`onError`（`AgentStreamEventBridge.java:206-231`）保证了「出错也发满终态」：
+`onError` 保证了「出错也发满终态」：
 
 ```java
 // 中断提示单独成 error 块：这是系统在说话，混进 answer 就跟模型的回答一个身份了
@@ -672,11 +707,11 @@ String messageId = settleAndPersistMessage(content, AgentMessageStatus.INTERRUPT
 sendTerminal(FINISH, new AgentCompletionPayload(messageId, title, "INTERRUPTED", facts.settleRun()));
 ```
 
-两行注释把理由写透了。**第一句是身份问题**——系统提示不能伪装成模型的话，所以单开一个 `error` 通道。**第二句是持久化一致性问题**——前端回放历史时，`blocks` 里有块就按块渲染、**不读 content**；如果那句「回复到这里中断了」只塞进 content 而不落成块，刷新后这句就没了。所以「块」和「当场的增量」都要发。
+两行注释把理由写透了。**第一句是身份问题**——系统提示不能伪装成模型的话，所以单开一个 `error` 通道（`block` 的 `kind=error`）。**第二句是持久化一致性问题**——前端回放历史时，`blocks` 里有块就按块渲染、**不读 content**；如果那句「回复到这里中断了」只塞进 content 而不落成块，刷新后这句就没了。所以「块」和「当场的增量」都要发。
 
 ### 收尾落库的统一入口：`settleAndPersistMessage`
 
-三个出口（正常/出错/取消）最后都落到 `settleAndPersistMessage`（`:628-645`）：
+三个出口（正常/出错/取消）最后都落到 `settleAndPersistMessage`：
 
 ```java
 private String settleAndPersistMessage(String content, AgentMessageStatus status) {
@@ -696,12 +731,12 @@ private String settleAndPersistMessage(String content, AgentMessageStatus status
 **三件事的顺序是刻意的：**
 
 1. **`settleBlocks()`（锁内）**：封口当前文本块、把还开着的工具块（`pending`/`running`）改成 `interrupted`、剔除空文本块。这一步让「落库的 blocks」定格成一个终态快照。
-2. **`flushSealedTextBlocks()` 在落库之前**——注释（`:636`）「末段封口帧要赶在 finish/confirm/cancel 之前发出去」。为什么：终态帧（finish）里带的是落库后的 `messageId`，如果封口帧（block）落在 finish 之后，前端会先收到「这一轮结束了」再收到「最后一个块的封口」，时序错乱。**块封口 → 落库 → 终态**，这个次序不能乱。
+2. **`flushSealedTextBlocks()` 在落库之前**——注释「末段封口帧要赶在 finish/confirm/cancel 之前发出去」。为什么：终态帧（finish）里带的是落库后的 `messageId`，如果封口帧（block）落在 finish 之后，前端会先收到「这一轮结束了」再收到「最后一个块的封口」，时序错乱。**块封口 → 落库 → 终态**，这个次序不能乱。
 3. **落库失败返回 null**——调用方拿到 null 就**不能再发带 messageId 的终态**（因为前端会拿这个 messageId 去回放，回放不到就空一条）。
 
 ### 一个容易漏的场景：非流式终答的补发
 
-`onComplete` 里（`:184-199`）有个 `resend` 逻辑：
+`onComplete` 里有个 `resend` 逻辑：
 
 ```java
 String streamed = textOf(ANSWER);
@@ -727,10 +762,10 @@ if (resend) {
 
 ### 解析层：`useAgentStream.ts`
 
-和 workflow 档同一套「buffer 按行切、最后一段留回 buffer」的手写解析（`useAgentStream.ts:111-140`），外加两个 Agent 档特有的判断：
+和 workflow 档同一套「buffer 按行切、最后一段留回 buffer」的手写解析，外加两个 Agent 档特有的判断：
 
-1. **`done` 是硬约束**（`:142-147`）：没收到 `done` 且不是自己取消的，直接 throw「连接已中断，本轮回答未完成」——否则这一轮永远停在「等待响应」。
-2. **裁决走 POST、不允许重试**（`:150-152`）：
+1. **`done` 是硬约束**：没收到 `done` 且不是自己取消的，直接 throw「连接已中断，本轮回答未完成」——否则这一轮永远停在「等待响应」。
+2. **裁决走 POST、不允许重试**：
 
 ```ts
 // 只发一次 失败就交给上层：Agent 一轮里可能已经执行过写操作
@@ -749,13 +784,13 @@ async function streamOnce(...)
 
 三个体现：
 
-1. **`applyTextBlockSeal` 认领「最早那个同类且还没收口」的块**（`:161-179`）：服务端按封口先后发 block 帧，前端**依次认领**就与之一一对应，帧里不必另带块标识。认不到就丢弃——注释（`:159`）「无主的起止挂到别的块上，就是把一段文字的耗时说成另一段的」。
+1. **`applyTextBlockSeal` 认领「最早那个同类且还没收口」的块**：服务端按封口先后发 block 帧，前端**依次认领**就与之一一对应，帧里不必另带块标识。认不到就丢弃——注释「无主的起止挂到别的块上，就是把一段文字的耗时说成另一段的」。
 
-2. **`matchToolIndex` 优先按 `toolCallId` 配对**（`:96-114`）：同名并行工具不会串块；只有端点不回 id 的**旧数据**才按名字回落（降级后果是「同名并行且无 id 时两条结果可能张冠李戴，但调用次数与状态推进不会错」）。
+2. **`matchToolIndex` 优先按 `toolCallId` 配对**：同名并行工具不会串块；只有端点不回 id 的**旧数据**才按名字回落（降级后果是「同名并行且无 id 时两条结果可能张冠李戴，但调用次数与状态推进不会错」）。
 
-3. **`batchWindow` 算批头时间是「工具体时间包络」**（`:275-292`）：起点取最早开工、终点取最晚收工——并行工具的区间本就重叠，逐条相加会把重叠段算两遍。而且注释（`:273`）明确这个「包络」**不等于**后端那个 `tool_batch`（后端从 acting 入口起算，含权限判定，比包络长几十毫秒），两个数不该互相对账。
+3. **`batchWindow` 算批头时间是「工具体时间包络」**：起点取最早开工、终点取最晚收工——并行工具的区间本就重叠，逐条相加会把重叠段算两遍。而且注释明确这个「包络」**不等于**后端那个 `tool_batch`（后端从 acting 入口起算，含权限判定，比包络长几十毫秒），两个数不该互相对账。
 
-**这套「纯投影」的价值**：它保证了「刷新前后是同一份」。因为落库的 `blocks` 和流出的 SSE 帧写的是**同一组字段**（`replayBlock` 和 `applyToolFrame` 都读 `startedAt/endedAt/durationMs/durationSource`），前端回放时不重新计算，照抄服务端——所以刷新不会「跳一下」。
+**这套「纯投影」的价值**：它保证了「刷新前后是同一份」。因为落库的 `blocks` 和流出的 SSE 帧写的是**同一组字段**（`replayBlock` 和工具块 apply 都读 `startedAt/endedAt/durationMs/durationSource`），前端回放时不重新计算，照抄服务端——所以刷新不会「跳一下」。
 
 **埋钩子**：前端消费得很完整。但有一个消费者**缺席了**——评测。这是这一篇里我最不体面的一处，也是最后一个问题。
 
@@ -767,15 +802,17 @@ async function streamOnce(...)
 
 **我**：⚠️ **没有。这是我要主动说清楚的一件事——Agent 档的协议演进先于评测落地。**
 
-看代码事实：`ragenteval` 里的 `eval/agent/` 目录**只有空脚手架**——`dataset/`、`metrics/`、`pipeline/`、`report/` 四个子目录里都只有 `__init__.py`，没有任何实现。现有的评测（`eval/rag/`）只覆盖 workflow 档：runner 打 `GET /rag/v3/chat`（SSE）+ `GET /rag/eval`（检索旁路）两次请求，拿回答和检索证据。
+看代码事实：`ragenteval` 里的 `eval/agent/` 目录**只有空脚手架**——`dataset/`、`metrics/`、`pipeline/`、`report/` 四个子目录里都只有 `__init__.py`，没有任何实现。现有的评测（`eval/rag/`）只覆盖 workflow 档：runner 打 `GET /rag/v3/chat`（SSE）+ `GET /rag/eval`（检索旁路）两次请求，拿回答和检索证据。评估集字段里也没有 `tool_calls_gold`——所以本版不评 Tool Calling。
 
 **这意味着什么，三条：**
 
-1. **Agent 档的 9 事件协议，目前唯一的消费者是前端**。评测脚本的 `parse_sse_stream` 只认 workflow 档的 6 个事件（`finish`/`reject`/`cancel`/`message`），没有解析 `tool`/`block`/`confirm`。
+1. **Agent 档的 8 事件协议，目前唯一的消费者是前端**。评测脚本的 `parse_sse_stream` 只认 workflow 档的 6 个事件（`finish`/`reject`/`cancel`/`message`），没有解析 `block`/`hint`/`confirm`。
 
 2. **workflow 档的评测双接口模式，Agent 档没有对应物。** workflow 档靠 `/rag/eval` 拿检索证据来算 context_precision/recall；Agent 档要测「工具调用对不对、证据用没用」，需要的不是检索旁路，而是**工具调用轨迹**——而那个轨迹其实已经在落库的 `t_agent_message.blocks`（JSONB）里了，只是评测侧还没有读它的管道。
 
-3. **所以如果我被追问「Agent 档质量怎么保证」，我的诚实答案是**：当前靠「前端可视化的过程流」做人工验收 + 复用 workflow 档检索质量的回归（因为 `search_knowledge` 内部跑的就是老管线）；**自动化的 Agent 评测（工具调用正确率、多轮一致性、确认流程）还没落地，这是我最想补的一块。**
+3. **所以如果我被追问「Agent 档质量怎么保证」，我的诚实答案是**：协议层目前靠「前端可视化的过程流」做人工验收 + 复用 workflow 档检索质量的回归（因为 `search_knowledge` 内部跑的就是老管线）；**自动化的 Agent 评测（工具调用正确率、多轮一致性、确认流程）还没落地，这是我最想补的一块。**
+
+> 注意区分：**记忆侧已经有专项测评台**（`resources/regression/agent-memory-evaluation`，能出断言通过率、裁剪块数/净回收字符、摘要次数/素材压缩率、tokens、baseline-variant 对比），但那测的是记忆治理，不是 Agent 档的流式协议。**端到端的 Agent 评测（ragenteval `eval/agent`）仍然是空的**，两件事别混。
 
 **如果现在让我补，方向是**：既然 `blocks` 已经是「推理/工具/答案」的有序序列，评测其实不需要再打一次 SSE——**直接读落库的 `blocks` 就能重建完整轨迹**，比 workflow 档「双接口、两套检索」的妥协干净得多。workflow 档那个「答案和证据不同源」的老问题（打两次请求、两次独立检索），在 Agent 档根本不存在——因为块和证据本来就在一条落库记录里。
 
@@ -792,29 +829,33 @@ async function streamOnce(...)
 | Q2「命令式订阅 Flux」 | 为什么不上 WebFlux？ | ✅ Q2：双技术栈 / 不需背压 / 取消语义重做 |
 | Q2「doFinally 标记上游终止」 | 这个信号干嘛用？ | ✅ Q9：等框架存盘的 CountDownLatch |
 | Q3「框架事件不能直接透出」 | 为什么？ | ✅ 引擎私有语义 + 粒度不匹配 + 内部工具要过滤 |
+| Q4「8 事件，中间做过 9」 | 为什么砍掉 tool 事件？ | ✅ Q4：两套同构状态机；过程帧应该一个帧型 + kind |
 | Q4「有意保留两套协议」 | 为什么不合并？ | ✅ 合并让 RAG 契约背不存在的状态；两套变更风险隔离 |
-| Q4「error 只加 type 不加事件」 | 那 block/tool 为什么不能也塞 type？ | ✅ 它们是协议状态变化（有起止/状态机），不是渲染分流 |
+| Q4「error 只加 type 不加事件」 | 那 block 为什么不能也塞 type？ | ✅ 块有起止和状态机，是协议状态变化不是渲染分流 |
 | Q5「块边界靠下一种事件当哨兵」 | 那最后一个块谁封？ | ✅ 收尾时 `settleBlocks()` 统一封口 |
 | Q5「只广播有起止的块」 | 没起止的块发了会怎样？ | ✅ 前端把正在接收的块错误收口，显示错位 |
 | Q5「锁内改状态锁外发帧」 | 持锁发帧会怎样？ | ✅ SSE 是 IO，emitter.send 阻塞卡死所有回调线程 |
+| Q6「工具进度走 block{kind:tool}」 | 为什么不单独发事件？ | ✅ 同一套块骨架，前端只需一个列表（Q4 收敛） |
 | Q6「整批推 awaiting」 | 只推点名的不行吗？ | ✅ 其余留 pending 收尾被判 interrupted，显示像被中断 |
 | Q6「整批被拒不给我起止」 | 为什么不给？ | ✅ 从没执行过，给时间就是撒谎，应显示「未执行」 |
 | Q7「桥只投影时间」 | 桥自己打会怎样？ | ✅ 两套口径，同一工具在卡片和文本块显示不同耗时 |
 | Q7「CAS 定格时刻」 | 为什么 CAS 不是锁？ | ✅ 调用散在四处、可能并发到达，第一次说了算 |
 | Q8「锁必须可重入」 | 不可重入会怎样？ | ✅ 同步结束的流在 subscribe 栈里回调收尾，自锁死 |
-| Q8「fail 额外置 stateSaveRequired」 | 为什么要这个标志？ | ✅ 出错框架没存盘，释放钩子据此决定补存 |
+| Q8「cancel 也置 stateSaveRequired」 | 取消不是已经存了吗？ | ✅ 优雅中断可能超时，不知道成没成，宁可按需补存 |
 | Q9「取消先 interrupt 再 dispose」 | 顺序反了会怎样？ | ✅ 直接断流，框架连存盘都来不及，丢本轮状态 |
 | Q9「2 秒等待」 | 拿什么换的？ | ✅ 换框架优雅存盘的机会，超时才强断 + 兜底补存 |
-| Q10「compareAndSet 释放」 | 无条件删会怎样？ | ✅ TTL 挤掉后被下一轮抢走，无条件删放掉别人的闸门 |
-| Q10「闸门按用户」 | 放开到 user+会话会怎样？ | ✅ 记忆同为用户级会撞 revision；先改记忆冲突重放再放闸门（见《记忆系统的三层架构.md》Q5.1） |
-| Q11「三出口都判 settleAwaitingConfirm」 | 为什么不是只 onComplete 判？ | ✅ 挂起态与「怎么结束的」正交，取消/出错都不该丢待确认动作 |
+| Q10「会话锁 + 名额锁」 | 为什么不是用户级单流？ | ✅ 用户开两会话是合理需求；真正要互斥的是同一份框架状态 |
+| Q10「无 TTL，看门狗续期」 | 进程崩溃了怎么办？ | ✅ 看门狗停止续期后自动释放；活流不会被误放 |
+| Q10「闸门放宽，记忆怎么办」 | 记忆写会撞吗？ | ✅ 记忆侧有用户级 Redisson 锁，Learner/Flusher 共用；拿不到锁就不调 judge |
+| Q11「两出口判 settleAwaitingConfirm」 | 为什么 onError 不判？ | ✅ 确认事件后框架正常收尾，挂起态与报错互斥 |
+| Q11「取消也走确认流程」 | 取消不是结束了吗？ | ✅ 用户取消的是这次流，不是那个待确认动作 |
 | Q12「前端只传 approved」 | 传完整参数会怎样？ | ✅ 攻击者可在卡片上篡改写操作入参 |
 | Q12「先结算后订阅」 | 反过来会怎样？ | ✅ 取消漏掉「这批工具执行了没」的结算 |
 | Q13「error 单独成块」 | 只塞 content 会怎样？ | ✅ 回放有块不读 content，刷新后这句消失 |
 | Q13「块封口先于终态」 | 反了会怎样？ | ✅ 前端先收到「结束」再收到「最后一个块封口」，时序错乱 |
 | Q14「Agent 不重试」 | RAG 为什么能重试？ | ✅ RAG 无副作用；Agent 可能已写，且无法自证没跑起来 |
 | Q14「纯投影不推断」 | 前端自己算会怎样？ | ✅ 刷新前后时间线跳变，与落库对不上 |
-| Q15「Agent 档评测没落地」 | ⚠️ **主动暴露** | ✅ 诚实：空脚手架；但 blocks 已含完整轨迹，补评测比 workflow 干净 |
+| Q15「Agent 档评测没落地」 | ⚠️ **主动暴露** | ✅ 诚实：eval/agent 空脚手架；但记忆侧有专项测评台，别混为一谈 |
 
 ---
 
@@ -842,12 +883,13 @@ async function streamOnce(...)
 
 这篇里会被追问的数字不多，但每一个都要带口径：
 
-- **`sse-timeout-ms: 900000`（15 分钟）**——为什么是 workflow 档（5 分钟）的三倍：多次工具调用 + 确认挂起时 SseEmitter 一直开着。
+- **`agent.sse-timeout-ms: 900000`（15 分钟）**——为什么是 workflow 档（5 分钟）的三倍：多次工具调用 + 确认挂起时 SseEmitter 一直开着。
 - **`GRACEFUL_INTERRUPT_WAIT_MS = 2000L`（2 秒）**——这是「等框架存盘」的上限，不是随意取的；超时走「强断 + 兜底补存」。
 - **`TOOL_RESULT_MAX_CHARS = 64_000`**——截断在缓冲层做，所以落库和展示天然一致。
-- **闸门 TTL = SSE 超时 × 2（30 分钟）**——进程崩溃时唯一兜底，长过活流、又不把人挡到下小时。
+- **`max-concurrent-runs-per-user = 5`**——每用户并行流上限；会话锁是硬互斥，名额锁只做资源保护。
+- **看门狗续期、无 TTL**——活流不会被误放，死流自动释放；这比旧版「TTL = SSE×2」精确。
 
-**最重要的一句**是那条一致性原则（`AgentToolExecutionFacts.java:35` 类注释，可逐字引用）：
+**最重要的一句**是那条一致性原则（`AgentToolExecutionFacts` 类注释，可逐字引用）：
 
 > 「同一个事实有两个算法，迟早会算出两个值。」
 
@@ -858,4 +900,4 @@ async function streamOnce(...)
 > **相邻稿件**
 > - 《[SSE流式怎么做.md](../项目深挖/SSE流式怎么做.md)》——workflow 档 6 事件底座 + 断连治理（跨节点取消 / 限流流内拒绝 / 两级 TTFT），本篇是它的 Agent 档演进
 > - 《[Agent化升级（新老机制对比）.md](Agent化升级（新老机制对比）.md)》——协议之外的新老对比（编排 / 工具 / 记忆 / 确认机制）；本篇只讲流式
-> - 《[Ragent升级清单.md](Ragent升级清单.md)》——升级项总索引，第八节「追问入口」里的「② 事件桥接：AgentStreamEventBridge」即本篇
+> - 《[Ragent升级清单.md](Ragent升级清单.md)》——升级项总索引，第十一节「追问入口」里的「② 事件桥接：AgentStreamEventBridge」即本篇
